@@ -1,0 +1,56 @@
+# Python Bytecode Files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg
+
+# Distribution / Packaging
+dist/
+build/
+*.egg-info/
+.installed.cfg
+MANIFEST
+
+# Virtual Environment
+# You usually want to ignore the whole environment folder
+venv/
+env/
+.venv/
+.env
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.nox/
+
+# PyInstaller / Nuitka / cx_Freeze
+# Compiled executables
+*.exe
+*.dll
+*.so
+*.dylib
+__main__.exe
+__main__.spec
+
+# MyPy / Static Type Checking
+.mypy_cache/
+
+# Editor/OS Specific Files
+# VS Code
+.vscode/
+
+# Jupyter Notebook Files
+.ipynb_checkpoints
+
+# Logs and Databases
+*.log
+*.sqlite3
+db.sqlite3
+
+# Project-Specific/Sensitive Files (If applicable)
+# NOTE: Replace 'settings.local.py' with your specific file name if needed
+settings.local.py
+config.yaml
+.env
