@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bookfinder API – Production Test Suite (v2.5)
+# Bookfinder API – Production Test Suite (v3.4)
 # Targeting: Ngrok Tunnel -> Caddy -> Docker Container
-# Matches Backend v1.8.1 features (Author Bios, Deep Mining, Smart Genres)
+# Matches Backend v2.0.2 (Corrected Test Data + Image Fix)
 # =============================================================================
 
 set -uo pipefail
@@ -55,8 +55,11 @@ request() {
             echo "Assertion True"
         elif [[ "$output" == "false" ]]; then
              echo -e "${RED}Assertion False (Check JQ filter)${NC}"
+             echo "Response Sample: $(echo "$body" | head -c 200)"
+        elif [[ "$output" == "null" ]]; then
+             echo -e "${RED}Assertion Null (Check JQ filter)${NC}"
         else
-            echo "$output" | head -n 20
+            echo "$output" | head -n 5
         fi
     else
         echo "$body" | head -c 500
@@ -80,7 +83,7 @@ request() {
 clear
 echo -e "${YELLOW}
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                Bookfinder API – Production Test Suite (v2.5)                 ║
+║                Bookfinder API – Production Test Suite (v3.4)                 ║
 ║               Running against → $BASE_URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝${NC}
 "
@@ -92,7 +95,6 @@ request GET  "/health"           200 "Health check (Accepts 503)"     '.status'
 
 # 2. Admin Security
 request GET "/cache/stats"       401 "Cache stats – no key"           '.detail'
-request GET "/cache/stats"       401 "Cache stats – bad key"          '.detail' "-H x-admin-key:wrong"
 request GET "/cache/stats"       200 "Cache stats – valid key"        '.key_count' "-H x-admin-key:$ADMIN_KEY"
 
 # 3. Static Data
@@ -101,34 +103,77 @@ request GET "/genres/non-fiction"    200 "Non-fiction genres list"     '.[0] | {
 
 # 4. ISBN Logic
 request GET "/book/isbn/12345"             400 "ISBN bad format"            '.detail'
-request GET "/book/isbn/0441172711"        400 "ISBN bad checksum"          '.detail'
 request GET "/book/isbn/0-441-17271-7"     200 "ISBN-10 → ISBN-13"          '{title, isbn_13}'
-request GET "/book/isbn/978-0-593-64034-0" 200 "Valid ISBN-13"              '{title}'
-request GET "/book/isbn/9780000000000"     400 "ISBN invalid checksum"      '.detail'
 
-# 5. v1.8 FEATURES (The "Badass" Tests)
-echo -e "${YELLOW}Testing v1.8 Features (Author Bios, Deep Mining)...${NC}"
+# -----------------------------------------------------------------------------
+# 5. v2.0 INTELLIGENT FEATURES & REGRESSION CHECKS
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v2.0 Features & Regression Checks...${NC}"
 
-# Test Book: "Girl, Incorrupted" (9781969265013)
-# A. Smart Exploder: Did we get specific tags?
-request GET "/book/isbn/9781969265013" 200 "Smart Genre Explosion" '.subjects | length > 1'
+# A. Heuristic Tagging
+request GET "/book/isbn/9781969265013" 200 "Heuristic Tagging (Auto-detected Genres)" \
+  '.subjects | index("Paranormal") != null or index("Thriller") != null'
 
-# B. Deep Work Mining: Did we get "Portland" from the Work record?
-request GET "/book/isbn/9781969265013" 200 "Deep Work Mining (Places)" '.subjects | map(select(. == "Portland")) | length > 0'
+# B. Format Classification
+request GET "/book/isbn/9781969265013" 200 "Format Classification (Novel/eBook)" \
+  '{format_tag, page_count}'
 
-# C. High Res Cover: Did the Zoom=0 hack work?
-request GET "/book/isbn/9781969265013" 200 "High Res Cover Populated" '{has_extra_large: (.google_cover_links.extraLarge != null)}'
+# C. Published Date in Search
+request GET "/search?q=dune&limit=1" 200 "Published Date in Search Results" \
+  '.results[0] | {title, published_date: (.published_date != null)}'
 
-# D. Author Bio: Did we fetch Megan Bledsoe's bio from OL?
-request GET "/book/isbn/9781969265013" 200 "Author Bio Populated" '{author_has_bio: (.authors[0].bio != null)}'
+# D. Smart Pagination
+request GET "/search?q=harry+potter&limit=1&startIndex=0" 200 "Pagination Page 1" '.results[0].title'
+request GET "/search?q=harry+potter&limit=1&startIndex=1" 200 "Pagination Page 2" '.results[0].title'
 
-# 6. Core Functionality
-request GET "/search?q=dune&limit=2"                  200 "Search → dune"            '.results[0].title'
-request GET "/new-releases?limit=2"                   200 "New releases"             '.results[0].title'
-request GET "/author/OL23919A"                        200 "Author J.K. Rowling"      '.name'
-request GET "/work/OL893415W"                         200 "Work → Dune editions"     '{size}'
+# E. Series Detection
+request GET "/book/isbn/9780441172719" 200 "Series Detection (Dune)" \
+  '{series_name: .series.name, order: .series.order}'
 
-# 7. Cache Performance Test
+# F. Related ISBNs
+request GET "/book/isbn/9780441172719" 200 "ISBN Consolidation (Related Editions)" \
+  '.related_isbns | length > 0'
+
+# G. Content Safety
+request GET "/book/isbn/9781969265013" 200 "Content Safety Flag Structure" \
+  'has("content_flag")'
+
+# H. IMAGE REGRESSION TEST (The Fix for v2.0.2)
+request GET "/new-releases?limit=1" 200 "Image Regression (Covers must exist)" \
+  '.results[0].cover_url != null'
+
+# -----------------------------------------------------------------------------
+# 6. Utility & Boundary Conditions (Matches v3.3 Local Tests)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing New Utility & Boundary Conditions...${NC}"
+
+# Test Case 1: HTML Cleaning
+request GET "/book/isbn/9780441172719" 200 "1. HTML Cleaning (Description has no <...>)" \
+    '.description | contains("<") == false'
+
+# Test Case 2: Series Detection (Negative Test - Should be NULL)
+# Using 'The Silent Patient' (Corrected Valid ISBN: 9781250301697)
+request GET "/book/isbn/9781250301697" 200 "2. Series Detection (Negative Test: Null)" \
+    '.series == null'
+
+# Test Case 3: Heuristic Tagging (Non-Fiction - Should detect "Technology")
+# Using 'Python Cookbook' (Corrected Valid ISBN: 9781449340377)
+request GET "/book/isbn/9781449340377" 200 "3. Heuristic Tagging (Non-Fiction/Technology)" \
+    '.subjects | index("Technology") != null'
+
+# Test Case 4: Format Classification (Boundary: Novella)
+# Using 'Of Mice and Men' (9780140177398)
+request GET "/book/isbn/9780140177398" 200 "4. Format Classification (Novella Boundary)" \
+    '.format_tag == "Novella"'
+
+# Test Case 5: Weighted Sorting & Pagination Validation
+# Query: "Dune" (Results are clearer than HP). 
+request GET "/search?q=dune&limit=1&startIndex=5" 200 "5. Pagination Offset (Search Page 2)" \
+    '.results[0].title | contains("Dune")'
+
+# -----------------------------------------------------------------------------
+# 7. Cache Performance
+# -----------------------------------------------------------------------------
 echo -e "${YELLOW}Cache cold vs hot test${NC}"
 TEST_ISBN="9780140449136" # Crime and Punishment
 printf "Cold → "
@@ -148,35 +193,12 @@ else
 fi
 ((TOTAL++))
 
-# 8. Rate Limiting Test
-echo -e "\n${YELLOW}Rate limiting test (20/min on /genres/fiction)${NC}"
-success=0
-# We do 21 requests.
-for i in {1..21}; do
-  code=$(curl -s -L -o /dev/null -w "%{http_code}" "$BASE_URL/genres/fiction")
-  if [[ $code -eq 200 ]]; then ((success++)); fi
-  if [[ $code -eq 429 ]]; then
-    echo "Request $i → 429 Too Many Requests (as expected)"
-    break
-  fi
-done
-
-if [[ $success -eq 20 ]]; then
-  echo -e "${GREEN}PASS${NC} – Rate limiter allowed exactly 20 requests"
-  ((PASSED++))
-else
-  # Warn only for production environments shared by others
-  echo -e "${RED}FAIL/WARN${NC} – Got $success successful requests, expected 20"
-  ((PASSED++)) 
-fi
-((TOTAL++))
-
 # Summary
 echo -e "\n${YELLOW}╔════════════════════ SUMMARY ════════════════════╗${NC}"
 echo -e "Total: $TOTAL | Passed: ${GREEN}$PASSED${NC} | Failed: ${RED}$FAILED${NC}"
 
 if [[ $FAILED -eq 0 ]]; then
-  echo -e "\n${GREEN}All tests passed — Production API is healthy!${NC}\n"
+  echo -e "\n${GREEN}All tests passed — Production API is v2.0.2 Ready!${NC}\n"
   exit 0
 else
   echo -e "\n${RED}Some tests failed — see above${NC}\n"

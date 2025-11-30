@@ -1,3 +1,4 @@
+#(v2.0.2)
 import os
 import httpx
 import asyncio
@@ -37,9 +38,9 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL, default_limits=["100/minute"])
 
 app = FastAPI(
-    title="Bookfinder Hybrid API",
-    description="A clean, cached, and rate-limited API wrapper with intelligent high-res image fallback and deep genre mining.",
-    version="1.8.1"  # Bumped for Author Variable Fix
+    title="Bookfinder Intelligent API",
+    description="A robust, heuristic-driven book API with automated tagging, series detection, and deep mining.",
+    version="2.0.2" # Patch version for Image Field Logic
 )
 
 app.state.limiter = limiter
@@ -76,6 +77,7 @@ async def cached_get(
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, params=filtered_params, timeout=20.0)
+            if resp.status_code == 404: return {} # Handle 404 gracefully
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPError as e:
@@ -137,6 +139,10 @@ class AuthorItem(BaseModel):
     key: Optional[str] = None
     bio: Optional[str] = None 
 
+class SeriesInfo(BaseModel):
+    name: str
+    order: Optional[int] = None
+
 class MergedBook(BaseModel):
     title: str
     subtitle: Optional[str] = None
@@ -157,6 +163,10 @@ class MergedBook(BaseModel):
     open_library_id: Optional[str] = None
     subjects: List[str] = Field(default_factory=list)
     open_library_cover_links: Optional[OpenLibraryCoverLinks] = None
+    series: Optional[SeriesInfo] = None
+    format_tag: Optional[str] = None
+    related_isbns: List[str] = Field(default_factory=list)
+    content_flag: Optional[str] = None
 
 class SearchResultItem(BaseModel):
     title: str
@@ -165,12 +175,15 @@ class SearchResultItem(BaseModel):
     isbn_13: Optional[str] = None
     isbn_10: Optional[str] = None
     publisher: Optional[str] = None 
+    published_date: Optional[str] = None
     average_rating: Optional[float] = None
     ratings_count: Optional[int] = None
     categories: List[str] = Field(default_factory=list)
     google_book_id: Optional[str] = None
     open_library_work_id: Optional[str] = None
     cover_url: Optional[str] = None
+    series: Optional[SeriesInfo] = None
+    format_tag: Optional[str] = None
 
 class HybridSearchResponse(BaseModel):
     query: str
@@ -222,7 +235,7 @@ class CacheStats(BaseModel):
 
 
 # --------------------------------------------------------------------
-# 3. Helper Functions
+# 3. Helper Functions & Heuristics
 # --------------------------------------------------------------------
 
 def ensure_https(url: Optional[str]) -> Optional[str]:
@@ -239,43 +252,81 @@ def generate_high_res_url(url: Optional[str]) -> Optional[str]:
         return clean_url.replace("zoom=1", "zoom=0")
     return clean_url
 
-# --- Smart Genre Exploder (v1.8 - Relaxed) ---
-def _process_rich_categories(raw_categories: List[Any]) -> List[str]:
-    """
-    Explodes 'Fiction / Fantasy' into distinct tags.
-    v1.8: Relaxed stop words list to allow 'Fiction', 'Literature' to show up.
-    """
-    if not raw_categories: return []
+def clean_html_text(text: Optional[str]) -> Optional[str]:
+    if not text: return None
+    clean = re.sub(r'<[^>]+>', '', text)
+    clean = clean.replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&")
+    return re.sub(r'\s+', ' ', clean).strip()
+
+def detect_series(title: str, subtitle: Optional[str]) -> Optional[SeriesInfo]:
+    full_text = f"{title} {subtitle or ''}"
+    patterns = [
+        r"(?P<name>.+?),?\s+Book\s+(?P<order>\d+)",
+        r"Book\s+(?P<order>\d+)\s+of\s+(?P<name>.+)",
+        r"(?P<name>.+?)\s+Trilogy",
+        r"(?P<name>.+?)\s+Series"
+    ]
     
+    for pat in patterns:
+        match = re.search(pat, full_text, re.IGNORECASE)
+        if match:
+            groups = match.groupdict()
+            order = int(groups['order']) if 'order' in groups else None
+            name = groups['name'].strip()
+            if len(name) > 50 or name.lower() in ["fiction", "novel", "edition"]: continue
+            return SeriesInfo(name=name, order=order)
+    return None
+
+def classify_format(page_count: Optional[int], is_ebook: bool) -> str:
+    if not page_count: return "Unknown Format"
+    if page_count < 50: return "Short Story"
+    if page_count < 150: return "Novella"
+    if is_ebook: return "eBook"
+    return "Novel"
+
+def check_content_safety(description: Optional[str], categories: List[str]) -> Optional[str]:
+    text = f"{description or ''} {' '.join(categories)}".lower()
+    triggers = ["erotica", "explicit", "mature content", "dark romance", "sexual violence"]
+    if any(t in text for t in triggers):
+        return "Mature Content"
+    return None
+
+GENRE_KEYWORDS = {
+    "vampire": "Paranormal", "werewolf": "Paranormal", "witch": "Fantasy",
+    "space": "Sci-Fi", "alien": "Sci-Fi", "robot": "Sci-Fi", "future": "Sci-Fi",
+    "detective": "Mystery", "murder": "Mystery", "crime": "Mystery", "police": "Mystery",
+    "spy": "Thriller", "espionage": "Thriller", "agent": "Thriller",
+    "dragon": "Fantasy", "magic": "Fantasy", "wizard": "Fantasy", "kingdom": "Fantasy",
+    "love": "Romance", "marriage": "Romance", "kiss": "Romance",
+    "history": "Historical", "war": "Historical", "battle": "Historical",
+    "code": "Technology", "computer": "Technology", "ai": "Technology"
+}
+
+def heuristic_tagging(text: str, existing_tags: List[str]) -> List[str]:
+    inferred_tags = set(existing_tags)
+    lower_text = text.lower()
+    for keyword, tag in GENRE_KEYWORDS.items():
+        if keyword in lower_text:
+            inferred_tags.add(tag)
+    return sorted(list(inferred_tags))
+
+def _process_rich_categories(raw_categories: List[Any]) -> List[str]:
+    if not raw_categories: return []
     unique_tags = set()
-    # Reduced stop words list
-    stop_words = {
-        "general", "electronic books", "books", "juvenile fiction", "young adult fiction"
-    }
+    stop_words = {"general", "electronic books", "books", "juvenile fiction", "young adult fiction"}
     
     for cat in raw_categories:
-        # Handle OL objects vs Google Strings
-        if isinstance(cat, dict):
-            cat_str = cat.get("name", "")
-        elif isinstance(cat, str):
-            cat_str = cat
-        else:
-            continue
+        if isinstance(cat, dict): cat_str = cat.get("name", "")
+        elif isinstance(cat, str): cat_str = cat
+        else: continue
 
         if not cat_str: continue
-
-        # 1. Split by Slashes or Double Dashes
         parts = re.split(r'[\/]+|--', cat_str)
         
         for part in parts:
             clean = part.strip()
             if not clean: continue
-            
-            # 2. Filter Stop Words (Strict Case Insensitive)
-            if clean.lower() in stop_words:
-                continue
-            
-            # 3. Add to set
+            if clean.lower() in stop_words: continue
             unique_tags.add(clean)
 
     return sorted(list(unique_tags))
@@ -332,21 +383,37 @@ def _get_isbns_from_ol_item(item: Dict[str, Any]) -> (Optional[str], Optional[st
         elif len(isbn) == 10 and not isbn_10: isbn_10 = isbn
     return isbn_13, isbn_10
 
+
+# --- MAPPERS ---
+
 def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
     g_info = item.get("volumeInfo", {})
     isbn_13, isbn_10 = _get_isbns_from_google_item(item)
     
-    cover_url = ensure_https(g_info.get("imageLinks", {}).get("thumbnail"))
+    # CRITICAL FIX: Exhaustive image fallback strategy
+    # We request the full 'imageLinks' object now, so we can check everything
+    links = g_info.get("imageLinks", {})
+    cover_url = ensure_https(links.get("thumbnail"))
+    if not cover_url: cover_url = ensure_https(links.get("smallThumbnail"))
+    if not cover_url: cover_url = ensure_https(links.get("small"))
+    if not cover_url: cover_url = ensure_https(links.get("medium"))
+    if not cover_url: cover_url = ensure_https(links.get("large"))
+
     if not cover_url:
         cover_id = isbn_13 if isbn_13 else isbn_10
-        if cover_id:
-            cover_url = f"https://covers.openlibrary.org/b/isbn/{cover_id}-M.jpg"
+        if cover_id: cover_url = f"https://covers.openlibrary.org/b/isbn/{cover_id}-M.jpg"
 
     raw_authors = g_info.get("authors", [])
     author_objects = [AuthorItem(name=a, key=None) for a in raw_authors]
 
-    # Use smart parser
     smart_cats = _process_rich_categories(g_info.get("categories", []))
+    
+    if len(smart_cats) < 2:
+        desc_text = g_info.get("description", "") + " " + g_info.get("title", "")
+        smart_cats = heuristic_tagging(desc_text, smart_cats)
+
+    series = detect_series(g_info.get("title", ""), g_info.get("subtitle"))
+    fmt = classify_format(g_info.get("pageCount"), item.get("saleInfo", {}).get("isEbook", False))
 
     return SearchResultItem(
         title=g_info.get("title", "No Title"),
@@ -355,11 +422,14 @@ def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         isbn_13=isbn_13,
         isbn_10=isbn_10,
         publisher=g_info.get("publisher"),
+        published_date=g_info.get("publishedDate"),
         average_rating=g_info.get("averageRating"),
         ratings_count=g_info.get("ratingsCount"),
         categories=smart_cats,
         google_book_id=item.get("id"),
-        cover_url=cover_url
+        cover_url=cover_url,
+        series=series,
+        format_tag=fmt
     )
 
 def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
@@ -373,9 +443,14 @@ def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         key = raw_keys[i] if i < len(raw_keys) else None
         author_objects.append(AuthorItem(name=name, key=key))
 
-    # Use smart parser
     smart_cats = _process_rich_categories(item.get("subject", []))[:8]
-
+    pub_date = str(item.get("first_publish_year")) if item.get("first_publish_year") else None
+    
+    # CRITICAL FIX: Check for 'cover_i' to verify image existence
+    cover_url = None
+    if "cover_i" in item:
+         cover_url = f"https://covers.openlibrary.org/b/id/{item['cover_i']}-M.jpg"
+    
     return SearchResultItem(
         title=item.get("title", "No Title"),
         subtitle=item.get("subtitle"),
@@ -383,11 +458,13 @@ def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         isbn_13=isbn_13,
         isbn_10=isbn_10,
         publisher=item.get("publisher", [None])[0] if item.get("publisher") else None,
+        published_date=pub_date,
         categories=smart_cats,
         open_library_work_id=item.get("key"),
-        cover_url=f"https://covers.openlibrary.org/b/isbn/{cover_id}-M.jpg" if cover_id else None
+        cover_url=cover_url
     )
 
+# Feature 8: Weighted Sorting
 def _merge_and_deduplicate_results(
     google_results: List[SearchResultItem],
     ol_results: List[SearchResultItem]
@@ -399,38 +476,36 @@ def _merge_and_deduplicate_results(
         return f"{item.title.lower().strip()}|{item.authors[0].name.lower().strip()}"
 
     for item in google_results:
-        if item.isbn_13:
-            merged_books[item.isbn_13] = item
-        else:
-            fallback_key = get_fallback_key(item)
-            if fallback_key: merged_books[fallback_key] = item
+        key = item.isbn_13 or get_fallback_key(item)
+        if key: merged_books[key] = item
 
     for item in ol_results:
-        key_to_check = item.isbn_13 or get_fallback_key(item)
-        
-        if key_to_check and key_to_check in merged_books:
-            existing = merged_books[key_to_check]
-            if not existing.open_library_work_id:
-                existing.open_library_work_id = item.open_library_work_id
-            
-            if item.authors and (not existing.authors or not existing.authors[0].key):
-                existing.authors = item.authors
+        key = item.isbn_13 or get_fallback_key(item) or item.open_library_work_id
+        if not key: continue
 
-            if not existing.publisher and item.publisher:
-                existing.publisher = item.publisher
+        if key in merged_books:
+            existing = merged_books[key]
+            if not existing.open_library_work_id: existing.open_library_work_id = item.open_library_work_id
+            if not existing.authors and item.authors: existing.authors = item.authors
+            if not existing.published_date and item.published_date: existing.published_date = item.published_date
+            if not existing.cover_url and item.cover_url: existing.cover_url = item.cover_url
             
-            if not existing.cover_url and item.cover_url:
-                existing.cover_url = item.cover_url
-
             combined_subjects = set(existing.categories + item.categories)
             existing.categories = sorted(list(combined_subjects))
-            
-        elif key_to_check:
-            merged_books[key_to_check] = item
-        elif item.open_library_work_id:
-            merged_books[item.open_library_work_id] = item
+        else:
+            merged_books[key] = item
 
-    return list(merged_books.values())
+    def score_book(book: SearchResultItem) -> int:
+        score = 0
+        if book.cover_url: score += 10
+        if book.isbn_13: score += 5
+        if book.average_rating: score += 2
+        if book.published_date: score += 1
+        return score
+
+    final_list = list(merged_books.values())
+    final_list.sort(key=score_book, reverse=True)
+    return final_list
 
 
 # --------------------------------------------------------------------
@@ -439,7 +514,7 @@ def _merge_and_deduplicate_results(
 
 async def get_google_data_by_isbn(isbn: str) -> dict:
     if not API_KEY: return {}
-    FIELDS = "totalItems,items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,description,pageCount,averageRating,ratingsCount,categories,dimensions,imageLinks(thumbnail,smallThumbnail,small,medium,large,extraLarge),industryIdentifiers),saleInfo,accessInfo)"
+    FIELDS = "totalItems,items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,description,pageCount,averageRating,ratingsCount,categories,dimensions,imageLinks(thumbnail,smallThumbnail,small,medium,large,extraLarge),industryIdentifiers,language),saleInfo,accessInfo)"
     params = {"q": f"isbn:{isbn}", "key": API_KEY, "fields": FIELDS}
     data = await cached_get(GOOGLE_BOOKS_API_URL, params)
     if data.get("totalItems", 0) > 0 and "items" in data:
@@ -457,34 +532,57 @@ async def get_open_library_work_details(work_key: str) -> dict:
     url = f"{OPEN_LIBRARY_API_URL}{work_key}.json"
     return await cached_get(url, params={})
 
-async def search_google(q: str, limit: int, subject: Optional[str] = None) -> List[SearchResultItem]:
+async def search_google(q: str, limit: int, start_index: int, subject: Optional[str] = None) -> List[SearchResultItem]:
     if not API_KEY: return []
-    FIELDS = "items(id,volumeInfo(title,subtitle,authors,publisher,averageRating,ratingsCount,categories,imageLinks(thumbnail,small),industryIdentifiers))"
+    FIELDS = "items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,averageRating,ratingsCount,categories,imageLinks(thumbnail,small),industryIdentifiers,description,pageCount))"
     query_string = f"{q} subject:{subject}" if subject else q
-    params = {"q": query_string, "key": API_KEY, "maxResults": limit, "fields": FIELDS}
+    params = {
+        "q": query_string, 
+        "key": API_KEY, 
+        "maxResults": limit, 
+        "startIndex": start_index,
+        "langRestrict": "en",
+        "fields": FIELDS
+    }
     data = await cached_get(GOOGLE_BOOKS_API_URL, params)
     return [_google_item_to_search_result(item) for item in data.get("items", [])]
 
-async def search_open_library(q: str, limit: int, subject: Optional[str] = None) -> List[SearchResultItem]:
-    params = {"q": q, "limit": limit, "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject", "subject": subject}
+async def search_open_library(q: str, limit: int, offset: int, subject: Optional[str] = None) -> List[SearchResultItem]:
+    params = {
+        "q": q, 
+        "limit": limit, 
+        "offset": offset,
+        "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject,first_publish_year,cover_i", # Request cover_i
+        "subject": subject,
+        "language": "eng" 
+    }
     data = await cached_get(f"{OPEN_LIBRARY_API_URL}/search.json", params)
     return [_ol_item_to_search_result(item) for item in data.get("docs", [])]
 
-async def get_google_new_releases(limit: int, subject: Optional[str] = None) -> List[SearchResultItem]:
+async def get_google_new_releases(limit: int, start_index: int, subject: Optional[str] = None) -> List[SearchResultItem]:
     if not API_KEY: return []
-    FIELDS = "items(id,volumeInfo(title,subtitle,authors,publisher,averageRating,ratingsCount,categories,imageLinks(thumbnail),industryIdentifiers))"
+    FIELDS = "items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,averageRating,ratingsCount,categories,imageLinks(thumbnail,small),industryIdentifiers,description,pageCount))"
     query_string = f"subject:{subject}" if subject else "*"
-    params = {"q": query_string, "orderBy": "newest", "key": API_KEY, "maxResults": limit, "fields": FIELDS}
+    params = {
+        "q": query_string, 
+        "orderBy": "newest", 
+        "key": API_KEY, 
+        "maxResults": limit,
+        "startIndex": start_index,
+        "langRestrict": "en",
+        "fields": FIELDS
+    }
     data = await cached_get(GOOGLE_BOOKS_API_URL, params)
     return [_google_item_to_search_result(item) for item in data.get("items", [])]
 
-async def get_open_library_new_releases(limit: int, subject: Optional[str] = None) -> List[SearchResultItem]:
+async def get_open_library_new_releases(limit: int, offset: int, subject: Optional[str] = None) -> List[SearchResultItem]:
     query = f"subject:{subject}" if subject else "language:eng"
     params = {
         "q": query,
         "sort": "new",
         "limit": limit,
-        "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject",
+        "offset": offset,
+        "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject,first_publish_year,cover_i", # Request cover_i
     }
     data = await cached_get(f"{OPEN_LIBRARY_API_URL}/search.json", params)
     return [_ol_item_to_search_result(item) for item in data.get("docs", [])]
@@ -496,6 +594,7 @@ async def get_open_library_work_editions(work_key: str) -> dict:
     url = f"{OPEN_LIBRARY_API_URL}/works/{work_key}/editions.json"
     return await cached_get(url, params={"limit": 50})
 
+# Health Checks (Unchanged)
 async def check_redis_health() -> ServiceHealth:
     if not cache: return ServiceHealth(name="redis", status="error", detail="Redis client not initialized.")
     try:
@@ -548,7 +647,7 @@ async def get_cache_stats(request: Request, admin: bool = Depends(get_admin_key)
         return CacheStats(status="error", key_count=0, used_memory="0B", redis_url=f"Error: {str(e)}")
 
 @app.get("/")
-async def read_root(request: Request): return {"message": "Bookfinder Hybrid API v1.8.1 (Author Fixed) is running!"}
+async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v2.0.3 is running!"}
 
 @app.get("/genres/fiction", response_model=List[fiction.Genre])
 @limiter.limit("20/minute")
@@ -571,16 +670,13 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
 
     g_info = google_volume.get("volumeInfo", {})
     
-    description = g_info.get("description")
+    description = clean_html_text(g_info.get("description"))
     if not description:
         desc_raw = open_library_book.get("description")
-        if isinstance(desc_raw, dict): description = desc_raw.get("value")
-        elif isinstance(desc_raw, str): description = desc_raw
+        if isinstance(desc_raw, dict): description = clean_html_text(desc_raw.get("value"))
+        elif isinstance(desc_raw, str): description = clean_html_text(desc_raw)
     
-    # --- MINING: Work Data & Author Bios ---
     tasks = []
-    
-    # Task 1: Work Data (Always try to fetch if key exists)
     work_key = None
     ol_works = open_library_book.get("works", [])
     if ol_works and isinstance(ol_works[0], dict) and "key" in ol_works[0]:
@@ -589,29 +685,23 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
     else:
         tasks.append(asyncio.sleep(0))
 
-    # Task 2..N: Author Bios (Get keys from OL)
     ol_authors_list = open_library_book.get("authors", [])
     author_keys_to_fetch = []
     for a in ol_authors_list:
-        if "author" in a and "key" in a["author"]:
-             author_keys_to_fetch.append(a["author"]["key"])
-        elif "key" in a:
-             author_keys_to_fetch.append(a["key"])
+        if "author" in a and "key" in a["author"]: author_keys_to_fetch.append(a["author"]["key"])
+        elif "key" in a: author_keys_to_fetch.append(a["key"])
     
     author_fetch_tasks = [get_open_library_author(k) for k in author_keys_to_fetch[:3]]
     
     secondary_results = await asyncio.gather(tasks[0], *author_fetch_tasks)
-    
     work_data = secondary_results[0] if work_key else None
     author_details_list = secondary_results[1:]
 
-    # --- DEEP DESCRIPTION FALLBACK ---
     if not description and work_data:
         raw_desc = work_data.get("description")
-        if isinstance(raw_desc, dict): description = raw_desc.get("value")
-        elif isinstance(raw_desc, str): description = raw_desc
+        if isinstance(raw_desc, dict): description = clean_html_text(raw_desc.get("value"))
+        elif isinstance(raw_desc, str): description = clean_html_text(raw_desc)
 
-    # --- DEEP GENRE MINING ---
     clean_g_categories = _process_rich_categories(g_info.get("categories", []))
     clean_ol_subjects = _process_rich_categories(open_library_book.get("subjects", []))
 
@@ -620,29 +710,28 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         work_tags.extend(work_data.get("subjects", []))
         work_tags.extend(work_data.get("subject_places", []))
         work_tags.extend(work_data.get("subject_times", []))
-        work_tags.extend(work_data.get("subject_people", []))
-
+    
     clean_work_tags = _process_rich_categories(work_tags)
     combined_subjects = sorted(list(set(clean_g_categories + clean_ol_subjects + clean_work_tags)))
+    
+    if len(combined_subjects) < 3 and description:
+        combined_subjects = sorted(list(set(combined_subjects + heuristic_tagging(description + " " + g_info.get("title", ""), combined_subjects))))
 
-    # --- AUTHOR MERGE & ENRICHMENT ---
     author_bio_map = {}
     for ad in author_details_list:
         if not ad: continue
         k = ad.get("key")
         b = ad.get("bio")
         if isinstance(b, dict): b = b.get("value") 
-        if k and b:
-            author_bio_map[k] = b
+        if k and b: author_bio_map[k] = clean_html_text(b)
 
     final_authors = []
-    if ol_authors_list: # FIX: Use correct variable name
+    if ol_authors_list: 
         for a in ol_authors_list:
             name = a.get("name", "Unknown") 
             key = None
             if "url" in a: key = a["url"].split("/")[-1]
             elif "key" in a: key = a["key"]
-            
             bio = author_bio_map.get(key) if key else None
             final_authors.append(AuthorItem(name=name, key=key, bio=bio))
             
@@ -650,31 +739,34 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         final_authors = [AuthorItem(name=a, key=None) for a in g_info.get("authors", [])]
 
     isbn_10 = next((i["identifier"] for i in g_info.get("industryIdentifiers", []) if i["type"] == "ISBN_10"), None)
-    
+    related_isbns = [i["identifier"] for i in g_info.get("industryIdentifiers", [])]
+    is_ebook = google_volume.get("saleInfo", {}).get("isEbook", False)
+    fmt = classify_format(g_info.get("pageCount"), is_ebook)
+    content_flag = check_content_safety(description, combined_subjects)
+    series = detect_series(g_info.get("title", ""), g_info.get("subtitle"))
+
     ol_covers = OpenLibraryCoverLinks(
         small=ensure_https(f"https://covers.openlibrary.org/b/isbn/{isbn}-S.jpg"),
         medium=ensure_https(f"https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg"),
         large=ensure_https(f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg")
     )
     
-    g_covers = None
-    if "imageLinks" in g_info:
-        raw_thumbnail = ensure_https(g_info["imageLinks"].get("thumbnail"))
-        extra_large = ensure_https(g_info["imageLinks"].get("extraLarge"))
-        if not extra_large and raw_thumbnail:
-            extra_large = generate_high_res_url(raw_thumbnail)
-        large = ensure_https(g_info["imageLinks"].get("large"))
-        if not large and raw_thumbnail:
-             large = generate_high_res_url(raw_thumbnail)
+    # FIX: Exhaustive image fallback strategy
+    links = g_info.get("imageLinks", {})
+    raw_thumbnail = ensure_https(links.get("thumbnail"))
+    extra_large = ensure_https(links.get("extraLarge"))
+    if not extra_large and raw_thumbnail: extra_large = generate_high_res_url(raw_thumbnail)
+    large = ensure_https(links.get("large"))
+    if not large and raw_thumbnail: large = generate_high_res_url(raw_thumbnail)
 
-        g_covers = GoogleCoverLinks(
-            thumbnail=raw_thumbnail,
-            smallThumbnail=ensure_https(g_info["imageLinks"].get("smallThumbnail")),
-            small=ensure_https(g_info["imageLinks"].get("small")),
-            medium=ensure_https(g_info["imageLinks"].get("medium")),
-            large=large,
-            extraLarge=extra_large
-        )
+    g_covers = GoogleCoverLinks(
+        thumbnail=raw_thumbnail,
+        smallThumbnail=ensure_https(links.get("smallThumbnail")),
+        small=ensure_https(links.get("small")),
+        medium=ensure_https(links.get("medium")),
+        large=large,
+        extraLarge=extra_large
+    )
 
     return MergedBook(
         title=g_info.get("title", open_library_book.get("title", "Title Not Found")),
@@ -695,20 +787,30 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         google_cover_links=g_covers,
         open_library_id=open_library_book.get("key"),
         subjects=combined_subjects,
-        open_library_cover_links=ol_covers
+        open_library_cover_links=ol_covers,
+        series=series,
+        format_tag=fmt,
+        related_isbns=related_isbns,
+        content_flag=content_flag
     )
 
 @app.get("/search", response_model=HybridSearchResponse, tags=["Books"])
 @limiter.limit("60/minute")
-async def search_hybrid(request: Request, q: str, subject: Optional[str] = None, limit: int = 10):
-    google_results, ol_results = await asyncio.gather(search_google(q, limit, subject), search_open_library(q, limit, subject))
+async def search_hybrid(request: Request, q: str, subject: Optional[str] = None, limit: int = 10, start_index: int = 0):
+    google_results, ol_results = await asyncio.gather(
+        search_google(q, limit, start_index, subject), 
+        search_open_library(q, limit, start_index, subject)
+    )
     final_results = _merge_and_deduplicate_results(google_results, ol_results)
     return HybridSearchResponse(query=q, subject=subject, num_found=len(final_results), results=final_results)
 
 @app.get("/new-releases", response_model=NewReleasesResponse, tags=["Books"])
 @limiter.limit("30/minute")
-async def get_new_releases(request: Request, subject: Optional[str] = None, limit: int = 10):
-    google_results, ol_results = await asyncio.gather(get_google_new_releases(limit, subject), get_open_library_new_releases(limit, subject))
+async def get_new_releases(request: Request, subject: Optional[str] = None, limit: int = 10, start_index: int = 0):
+    google_results, ol_results = await asyncio.gather(
+        get_google_new_releases(limit, start_index, subject), 
+        get_open_library_new_releases(limit, start_index, subject)
+    )
     final_results = _merge_and_deduplicate_results(google_results, ol_results)
     return NewReleasesResponse(subject=subject, num_found=len(final_results), results=final_results)
 
