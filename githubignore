@@ -1,0 +1,35 @@
+# Environment/Secrets (CRITICAL)
+# This file contains environment variables and secrets (like API keys)
+.env 
+
+# Dependencies/Virtual Environments
+.venv/
+venv/
+env/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3 # If you were using a local sqlite DB
+
+# Temporary files, Logs
+*.log
+*.tmp
+*.bak
+
+# Development-specific files and artifacts
+deleteme.txt
+oldmain.py
+test_api.sh.bak # If you make backups of your test scripts
+test_prod.sh.bak
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Build/Packaging
+dist/
+build/
+*.egg-info/

@@ -1,4 +1,4 @@
-#(v2.0.2)
+# (v2.0.3) - Strict Image Mode + Robust Env Loading
 import os
 import httpx
 import asyncio
@@ -6,7 +6,8 @@ import json
 import hashlib
 import sys
 import re
-from fastapi import FastAPI, Query, HTTPException, Request, Depends, Path, Header, Response, status
+from pathlib import Path
+from fastapi import FastAPI, Query, HTTPException, Request, Depends, Path as FastAPIPath, Header, Response, status
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from typing import List, Optional, Dict, Any
@@ -31,7 +32,10 @@ logger.add(
     format="{time} {level} {message}",
 )
 
-load_dotenv()
+# Robustly load .env from the same directory as main.py
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # Initialize Rate Limiter with Redis storage
@@ -40,7 +44,7 @@ limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL, default_li
 app = FastAPI(
     title="Bookfinder Intelligent API",
     description="A robust, heuristic-driven book API with automated tagging, series detection, and deep mining.",
-    version="2.0.2" # Patch version for Image Field Logic
+    version="2.0.3" 
 )
 
 app.state.limiter = limiter
@@ -246,6 +250,7 @@ def ensure_https(url: Optional[str]) -> Optional[str]:
     return secure_url
 
 def generate_high_res_url(url: Optional[str]) -> Optional[str]:
+    # NOTE: This function is deprecated in v2.0.3 logic but kept for utility.
     if not url: return None
     clean_url = ensure_https(url)
     if "zoom=1" in clean_url:
@@ -360,7 +365,7 @@ def _convert_isbn10_to_isbn13(isbn10: str) -> str:
     check_digit = (10 - (total % 10)) % 10
     return f"{base}{check_digit}"
 
-def validate_and_clean_isbn(isbn: str = Path(...)) -> str:
+def validate_and_clean_isbn(isbn: str = FastAPIPath(...)) -> str:
     cleaned_isbn = re.sub(r"[\s-]+", "", isbn)
     if len(cleaned_isbn) == 13:
         if _is_valid_isbn13_checksum(cleaned_isbn): return cleaned_isbn
@@ -751,13 +756,22 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         large=ensure_https(f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg")
     )
     
-    # FIX: Exhaustive image fallback strategy
+    # FIX: Strict Mapping. We do NOT use generate_high_res_url logic here anymore.
+    # We only map what Google explicitly gives us.
     links = g_info.get("imageLinks", {})
     raw_thumbnail = ensure_https(links.get("thumbnail"))
+    
+    # --- MODIFIED SECTION START ---
+    # We strictly use what Google provides. We do NOT guess high-res URLs anymore.
+    # If we guess wrong, the frontend breaks.
+    
     extra_large = ensure_https(links.get("extraLarge"))
-    if not extra_large and raw_thumbnail: extra_large = generate_high_res_url(raw_thumbnail)
+    # REMOVED: if not extra_large and raw_thumbnail: extra_large = generate_high_res_url(raw_thumbnail)
+    
     large = ensure_https(links.get("large"))
-    if not large and raw_thumbnail: large = generate_high_res_url(raw_thumbnail)
+    # REMOVED: if not large and raw_thumbnail: large = generate_high_res_url(raw_thumbnail)
+    
+    # --- MODIFIED SECTION END ---
 
     g_covers = GoogleCoverLinks(
         thumbnail=raw_thumbnail,

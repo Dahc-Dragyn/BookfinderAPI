@@ -1,0 +1,35 @@
+# Dependencies/Virtual Environments
+.venv/
+venv/
+env/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary files, Logs, Configuration
+.env # CRITICAL: Contains API keys (GOOGLE_API_KEY, ADMIN_KEY, REDIS_URL). Never copy into the image.
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# Development-specific files
+deleteme.txt # As indicated in your directory listing
+oldmain.py
+requirements-dev.txt # If you have a dev requirements file
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Git-related
+.git
+.gitignore
+
+# IDE/Editor files
+.vscode/
+.idea/
