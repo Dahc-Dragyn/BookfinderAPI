@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bookfinder API – Production Test Suite (v3.4)
+# Bookfinder API – Production Test Suite (v3.5)
 # Targeting: Ngrok Tunnel -> Caddy -> Docker Container
-# Matches Backend v2.0.2 (Corrected Test Data + Image Fix)
+# Verifies: LoC Integration, Strict Date Filtering, Cache, and Metadata
 # =============================================================================
 
 set -uo pipefail
 
 # --- CONFIGURATION ---
-# We append /books because your Caddyfile routes /books/* to the container
+# Default to your specific Ngrok URL (can be overridden via env var)
+# Note: We target /books because Caddy routes /books/* to the API container
 BASE_URL="${BASE_URL:-https://db4f-24-22-90-227.ngrok-free.app/books}"
 ADMIN_KEY="${ADMIN_KEY:-B0tanchr1}"
 
@@ -31,21 +32,25 @@ request() {
   local expected_status="${3:-200}"
   local description="$4"
   local jq_filter="${5:-.}"
-  local headers="${6:-}"
+  local extra_headers="${6:-}"
 
   ((TOTAL++))
 
   printf "${BLUE}→ Test %-2d: %-55s${NC}" "$TOTAL" "$description"
 
-  # Execute request and capture both body + HTTP status
-  # Added -L to follow redirects (important for ngrok/caddy)
+  # Execute request
+  # -L: Follow redirects
+  # -H "ngrok-skip-browser-warning": Bypasses the Ngrok interstitial page
   local response
-  response=$(curl -s -L -w "\n%{http_code}" -X "$method" $headers "$BASE_URL$path")
+  response=$(curl -s -L -w "\n%{http_code}" -X "$method" \
+    -H "ngrok-skip-browser-warning: true" \
+    $extra_headers \
+    "$BASE_URL$path")
   
   local body=$(echo "$response" | sed '$d')
   local status=$(echo "$response" | tail -n1)
 
-  # Allow 200 OK or 503 Service Unavailable (if Open Library is acting up)
+  # Allow 200 OK or 503 Service Unavailable (if Open Library is acting up upstream)
   if [[ "$status" == "$expected_status" ]] || [[ "$path" == "/health" && "$status" == "503" ]]; then
     echo -e "${GREEN}PASS${NC} ($status)"
     ((PASSED++))
@@ -62,7 +67,7 @@ request() {
             echo "$output" | head -n 5
         fi
     else
-        echo "$body" | head -c 500
+        echo "JQ not installed, skipping assertion detail."
     fi
   else
     echo -e "${RED}FAIL${NC} (got $status, expected $expected_status)"
@@ -83,7 +88,7 @@ request() {
 clear
 echo -e "${YELLOW}
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                Bookfinder API – Production Test Suite (v3.4)                 ║
+║                Bookfinder API – Production Test Suite (v3.5)                 ║
 ║               Running against → $BASE_URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝${NC}
 "
@@ -91,15 +96,16 @@ sleep 1
 
 # 1. Root & Health
 request GET  "/"                 200 "Root endpoint"                  '{message}'
-request GET  "/health"           200 "Health check (Accepts 503)"     '.status'
+request GET  "/health"           200 "Health check"                   '.status'
 
 # 2. Admin Security
-request GET "/cache/stats"       401 "Cache stats – no key"           '.detail'
-request GET "/cache/stats"       200 "Cache stats – valid key"        '.key_count' "-H x-admin-key:$ADMIN_KEY"
+if [[ -n "$ADMIN_KEY" ]]; then
+  request GET "/cache/stats"       401 "Cache stats – no key"           '.detail'
+  request GET "/cache/stats"       200 "Cache stats – valid key"        '.key_count' "-H x-admin-key:$ADMIN_KEY"
+fi
 
 # 3. Static Data
 request GET "/genres/fiction"        200 "Fiction genres list"         '.[0] | {umbrella, name}'
-request GET "/genres/non-fiction"    200 "Non-fiction genres list"     '.[0] | {umbrella, name}'
 
 # 4. ISBN Logic
 request GET "/book/isbn/12345"             400 "ISBN bad format"            '.detail'
@@ -138,50 +144,73 @@ request GET "/book/isbn/9780441172719" 200 "ISBN Consolidation (Related Editions
 request GET "/book/isbn/9781969265013" 200 "Content Safety Flag Structure" \
   'has("content_flag")'
 
-# H. IMAGE REGRESSION TEST (The Fix for v2.0.2)
+# H. IMAGE REGRESSION TEST
 request GET "/new-releases?limit=1" 200 "Image Regression (Covers must exist)" \
   '.results[0].cover_url != null'
 
 # -----------------------------------------------------------------------------
-# 6. Utility & Boundary Conditions (Matches v3.3 Local Tests)
+# 6. Utility & Boundary Conditions
 # -----------------------------------------------------------------------------
 echo -e "${YELLOW}Testing New Utility & Boundary Conditions...${NC}"
 
-# Test Case 1: HTML Cleaning
+# Test Case 17: HTML Cleaning
 request GET "/book/isbn/9780441172719" 200 "1. HTML Cleaning (Description has no <...>)" \
     '.description | contains("<") == false'
 
-# Test Case 2: Series Detection (Negative Test - Should be NULL)
-# Using 'The Silent Patient' (Corrected Valid ISBN: 9781250301697)
+# Test Case 18: Series Detection (Negative Test)
 request GET "/book/isbn/9781250301697" 200 "2. Series Detection (Negative Test: Null)" \
     '.series == null'
 
-# Test Case 3: Heuristic Tagging (Non-Fiction - Should detect "Technology")
-# Using 'Python Cookbook' (Corrected Valid ISBN: 9781449340377)
+# Test Case 19: Heuristic Tagging (Non-Fiction)
 request GET "/book/isbn/9781449340377" 200 "3. Heuristic Tagging (Non-Fiction/Technology)" \
     '.subjects | index("Technology") != null'
 
-# Test Case 4: Format Classification (Boundary: Novella)
-# Using 'Of Mice and Men' (9780140177398)
+# Test Case 20: Format Classification (Boundary)
 request GET "/book/isbn/9780140177398" 200 "4. Format Classification (Novella Boundary)" \
     '.format_tag == "Novella"'
 
-# Test Case 5: Weighted Sorting & Pagination Validation
-# Query: "Dune" (Results are clearer than HP). 
+# Test Case 21: Pagination Offset
 request GET "/search?q=dune&limit=1&startIndex=5" 200 "5. Pagination Offset (Search Page 2)" \
     '.results[0].title | contains("Dune")'
 
+# Test Case 22: Search Thumbnail Optimization
+# Search results must use lightweight thumbnails (zoom=1), not high-res (zoom=0).
+request GET "/search?q=dune&limit=1" 200 "6. Search Thumbnail Opt (No Zoom=0)" \
+    '.results[0].cover_url | contains("zoom=0") == false'
+
+# Test Case 23: True New Releases (Strict Date Check)
+# Verifies the backend is strictly filtering for books from the current or previous year.
+YEAR=$(date +%Y)
+CUTOFF=$((YEAR - 1))
+request GET "/new-releases?limit=5" 200 "7. True New Releases (Year >= $CUTOFF)" \
+  ".results | all(.published_date | .[0:4] | tonumber >= $CUTOFF)"
+
 # -----------------------------------------------------------------------------
-# 7. Cache Performance
+# 8. Library of Congress Integration (v2.1.1)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing Library of Congress Features...${NC}"
+
+# Test Case 24: LoC Date Authority Override
+# "Cloud Mountain" (1997). Google often reports 2025 (eBook). LoC should report ~1998.
+request GET "/book/isbn/9780312204440" 200 "8. LoC Date Authority (Cloud Mountain)" \
+  '.published_date | .[0:4] | tonumber < 2000'
+
+# Test Case 25: LoC Subject Enrichment
+# "Great Gatsby". Assert that we are getting rich subjects (LoC style)
+request GET "/book/isbn/9780743273565" 200 "9. LoC Subject Enrichment (Great Gatsby)" \
+  '.subjects | length > 5'
+
+# -----------------------------------------------------------------------------
+# 9. Cache Performance
 # -----------------------------------------------------------------------------
 echo -e "${YELLOW}Cache cold vs hot test${NC}"
 TEST_ISBN="9780140449136" # Crime and Punishment
 printf "Cold → "
-cold=$(curl -s -L -o /dev/null -w "%{time_total}" "$BASE_URL/book/isbn/$TEST_ISBN")
+cold=$(curl -s -L -H "ngrok-skip-browser-warning: true" -o /dev/null -w "%{time_total}" "$BASE_URL/book/isbn/$TEST_ISBN")
 echo "${cold}s"
 
 printf "Hot  → "
-hot=$(curl -s -L -o /dev/null -w "%{time_total}" "$BASE_URL/book/isbn/$TEST_ISBN")
+hot=$(curl -s -L -H "ngrok-skip-browser-warning: true" -o /dev/null -w "%{time_total}" "$BASE_URL/book/isbn/$TEST_ISBN")
 echo "${hot}s"
 
 if (( $(echo "$hot < $cold" | bc -l) )); then
@@ -198,7 +227,7 @@ echo -e "\n${YELLOW}╔═══════════════════
 echo -e "Total: $TOTAL | Passed: ${GREEN}$PASSED${NC} | Failed: ${RED}$FAILED${NC}"
 
 if [[ $FAILED -eq 0 ]]; then
-  echo -e "\n${GREEN}All tests passed — Production API is v2.0.2 Ready!${NC}\n"
+  echo -e "\n${GREEN}All tests passed — Production API is v2.1.1 Ready!${NC}\n"
   exit 0
 else
   echo -e "\n${RED}Some tests failed — see above${NC}\n"

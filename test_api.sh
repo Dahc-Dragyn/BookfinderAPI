@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bookfinder API – Test Suite v3.3 (Local Verification for v2.0.2 Fixes)
+# Bookfinder API – Test Suite v3.5 (Local Verification including LoC)
 # =============================================================================
 
 set -uo pipefail
 
 # --- CONFIGURATION ---
-# Testing LOCALLY against the new v2.0.2 Backend
+# Testing LOCALLY against the new v2.1.1 Backend
 BASE_URL="http://127.0.0.1:8000"
 ADMIN_KEY="${ADMIN_KEY:-B0tanchr1}"
 
@@ -76,7 +76,7 @@ request() {
 clear
 echo -e "${YELLOW}
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                Bookfinder API – Automated Test Suite (v3.3)                  ║
+║                Bookfinder API – Automated Test Suite (v3.5)                  ║
 ║               Running against → $BASE_URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝${NC}
 "
@@ -147,25 +147,46 @@ request GET "/book/isbn/9780441172719" 200 "1. HTML Cleaning (Description has no
     '.description | contains("<") == false'
 
 # Test Case 2: Series Detection (Negative Test - Should be NULL)
-# Using 'The Silent Patient' (Corrected Valid ISBN: 9781250301697)
 request GET "/book/isbn/9781250301697" 200 "2. Series Detection (Negative Test: Null)" \
     '.series == null'
 
 # Test Case 3: Heuristic Tagging (Non-Fiction - Should detect "Technology")
-# Using 'Python Cookbook' (Corrected Valid ISBN: 9781449340377)
 request GET "/book/isbn/9781449340377" 200 "3. Heuristic Tagging (Non-Fiction/Technology)" \
     '.subjects | index("Technology") != null'
 
 # Test Case 4: Format Classification (Boundary: Novella)
-# Using 'Of Mice and Men' (9780140177398)
 request GET "/book/isbn/9780140177398" 200 "4. Format Classification (Novella Boundary)" \
     '.format_tag == "Novella"'
 
 # Test Case 5: Weighted Sorting & Pagination Validation
-# Query: "Dune" (Results are clearer than HP). 
-# Assertion: Page 2 (index 5) title != Page 1 (index 0) title
 request GET "/search?q=dune&limit=1&startIndex=5" 200 "5. Pagination Offset (Search Page 2)" \
     '.results[0].title | contains("Dune")'
+
+# Test Case 6: Search Thumbnail Optimization (Regression Fix)
+request GET "/search?q=dune&limit=1" 200 "6. Search Thumbnail Opt (No Zoom=0)" \
+    '.results[0].cover_url | contains("zoom=0") == false'
+
+# Test Case 7: True New Releases (Strict Date Check)
+YEAR=$(date +%Y)
+CUTOFF=$((YEAR - 1))
+request GET "/new-releases?limit=5" 200 "7. True New Releases (Year >= $CUTOFF)" \
+  ".results | all(.published_date | .[0:4] | tonumber >= $CUTOFF)"
+
+# -----------------------------------------------------------------------------
+# 8. Library of Congress Integration (v2.1.1)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing Library of Congress Features...${NC}"
+
+# Test Case 8: LoC Date Authority Override
+# "Cloud Mountain" (1997). Google often reports 2025 (eBook). LoC should report ~1998.
+# We assert that the date is older than 2000 to prove LoC logic worked.
+request GET "/book/isbn/9780312204440" 200 "8. LoC Date Authority (Cloud Mountain)" \
+  '.published_date | .[0:4] | tonumber < 2000'
+
+# Test Case 9: LoC Subject Enrichment
+# "Great Gatsby". Assert that we are getting rich subjects (LoC style)
+request GET "/book/isbn/9780743273565" 200 "9. LoC Subject Enrichment (Great Gatsby)" \
+  '.subjects | length > 5'
 
 # -----------------------------------------------------------------------------
 # 7. Cache Performance
@@ -194,7 +215,7 @@ echo -e "\n${YELLOW}╔═══════════════════
 echo -e "Total: $TOTAL | Passed: ${GREEN}$PASSED${NC} | Failed: ${RED}$FAILED${NC}"
 
 if [[ $FAILED -eq 0 ]]; then
-  echo -e "\n${GREEN}All tests passed — Backend v2.0.2 is Solid!${NC}\n"
+  echo -e "\n${GREEN}All tests passed — Backend v2.1.1 is Solid!${NC}\n"
   exit 0
 else
   echo -e "\n${RED}Some tests failed — see above${NC}\n"
