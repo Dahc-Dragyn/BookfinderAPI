@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bookfinder API – Test Suite v3.5 (Local Verification including LoC)
+# Bookfinder API – Test Suite v4.5 (Final Validation)
 # =============================================================================
 
 set -uo pipefail
 
 # --- CONFIGURATION ---
-# Testing LOCALLY against the new v2.1.1 Backend
 BASE_URL="http://127.0.0.1:8000"
 ADMIN_KEY="${ADMIN_KEY:-B0tanchr1}"
 
@@ -76,7 +75,7 @@ request() {
 clear
 echo -e "${YELLOW}
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                Bookfinder API – Automated Test Suite (v3.5)                  ║
+║                Bookfinder API – Automated Test Suite (v4.5)                  ║
 ║               Running against → $BASE_URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝${NC}
 "
@@ -96,7 +95,7 @@ fi
 request GET "/genres/fiction"        200 "Fiction genres list"         '.[0] | {umbrella, name}'
 
 # 4. ISBN Logic
-request GET "/book/isbn/12345"             400 "ISBN bad format"            '.detail'
+request GET "/book/isbn/12345"             400 "ISBN bad format (Too Short)"            '.detail'
 request GET "/book/isbn/0-441-17271-7"     200 "ISBN-10 → ISBN-13"          '{title, isbn_13}'
 
 # -----------------------------------------------------------------------------
@@ -132,13 +131,12 @@ request GET "/book/isbn/9780441172719" 200 "ISBN Consolidation (Related Editions
 request GET "/book/isbn/9781969265013" 200 "Content Safety Flag Structure" \
   'has("content_flag")'
 
-# H. IMAGE REGRESSION TEST (The Fix for v2.0.2)
-# This specifically checks that the "new releases" endpoint returns items WITH cover URLs.
+# H. IMAGE REGRESSION TEST
 request GET "/new-releases?limit=1" 200 "Image Regression (Covers must exist)" \
   '.results[0].cover_url != null'
 
 # -----------------------------------------------------------------------------
-# 6. Utility & Boundary Conditions (v3.3 Corrected)
+# 6. Utility & Boundary Conditions
 # -----------------------------------------------------------------------------
 echo -e "${YELLOW}Testing New Utility & Boundary Conditions...${NC}"
 
@@ -146,15 +144,15 @@ echo -e "${YELLOW}Testing New Utility & Boundary Conditions...${NC}"
 request GET "/book/isbn/9780441172719" 200 "1. HTML Cleaning (Description has no <...>)" \
     '.description | contains("<") == false'
 
-# Test Case 2: Series Detection (Negative Test - Should be NULL)
+# Test Case 2: Series Detection (Negative Test)
 request GET "/book/isbn/9781250301697" 200 "2. Series Detection (Negative Test: Null)" \
     '.series == null'
 
-# Test Case 3: Heuristic Tagging (Non-Fiction - Should detect "Technology")
+# Test Case 3: Heuristic Tagging (Non-Fiction)
 request GET "/book/isbn/9781449340377" 200 "3. Heuristic Tagging (Non-Fiction/Technology)" \
     '.subjects | index("Technology") != null'
 
-# Test Case 4: Format Classification (Boundary: Novella)
+# Test Case 4: Format Classification (Boundary)
 request GET "/book/isbn/9780140177398" 200 "4. Format Classification (Novella Boundary)" \
     '.format_tag == "Novella"'
 
@@ -162,7 +160,7 @@ request GET "/book/isbn/9780140177398" 200 "4. Format Classification (Novella Bo
 request GET "/search?q=dune&limit=1&startIndex=5" 200 "5. Pagination Offset (Search Page 2)" \
     '.results[0].title | contains("Dune")'
 
-# Test Case 6: Search Thumbnail Optimization (Regression Fix)
+# Test Case 6: Search Thumbnail Optimization
 request GET "/search?q=dune&limit=1" 200 "6. Search Thumbnail Opt (No Zoom=0)" \
     '.results[0].cover_url | contains("zoom=0") == false'
 
@@ -178,21 +176,104 @@ request GET "/new-releases?limit=5" 200 "7. True New Releases (Year >= $CUTOFF)"
 echo -e "${YELLOW}Testing Library of Congress Features...${NC}"
 
 # Test Case 8: LoC Date Authority Override
-# "Cloud Mountain" (1997). Google often reports 2025 (eBook). LoC should report ~1998.
-# We assert that the date is older than 2000 to prove LoC logic worked.
 request GET "/book/isbn/9780312204440" 200 "8. LoC Date Authority (Cloud Mountain)" \
   '.published_date | .[0:4] | tonumber < 2000'
 
 # Test Case 9: LoC Subject Enrichment
-# "Great Gatsby". Assert that we are getting rich subjects (LoC style)
 request GET "/book/isbn/9780743273565" 200 "9. LoC Subject Enrichment (Great Gatsby)" \
   '.subjects | length > 5'
 
 # -----------------------------------------------------------------------------
-# 7. Cache Performance
+# 9. Deep Dredge & Cover Integrity (v3.0.2)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v3.0.2 Deep Dredge & Cover Integrity...${NC}"
+
+# Test Case 10: Funnel Fill
+request GET "/new-releases?limit=12&subject=Mystery" 200 "10. Deep Dredge Quantity (Exact Count)" \
+  '.results | length == 12'
+
+# Test Case 11: Cover Image Guarantee
+request GET "/new-releases?limit=10&subject=Thriller" 200 "11. Cover Image Guarantee (No Nulls)" \
+  '.results | all(.cover_url != null)'
+
+# Test Case 12: Deep Dredge Quality
+request GET "/new-releases?limit=20&subject=Sci-Fi" 200 "12. Deep Dredge Quality (No Old Books)" \
+  ".results | all(.published_date | .[0:4] | tonumber >= $CUTOFF)"
+
+# -----------------------------------------------------------------------------
+# 10. Regression Proofing (v3.7)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v3.7 Regression Proofing...${NC}"
+
+# Test Case 13: Metadata Hygiene
+request GET "/new-releases?limit=10&subject=History" 200 "13. Metadata Hygiene (Authors & Pubs)" \
+  '.results | all(.authors != [] and .publisher != null)'
+
+# Test Case 14: Spam/Reprint Guard
+request GET "/new-releases?limit=20&subject=Fantasy" 200 "14. Spam/Reprint Filter Check" \
+  '.results | all(.title | test("(?i)(summary|anniversary|analysis)") | not)'
+
+# -----------------------------------------------------------------------------
+# 11. Dual-Mode Author Strategy (v3.8)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v3.8 Dual-Mode Author Strategy...${NC}"
+
+# Test Case 15: Dual-Mode Check
+request GET "/author/Megan%20Bledsoe" 200 "15. Dual-Mode Author (Name Search)" \
+  '.source == "google_books" and (.books | length > 0)'
+
+# -----------------------------------------------------------------------------
+# 12. Bio Miner Validation (v3.9 - v4.0)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v3.9+ Bio Miner & Sanitization...${NC}"
+
+# Test Case 16: Bio Extraction (Specific Text)
+request GET "/author/Megan%20Bledsoe" 200 "16. Bio Miner (Extracted Text)" \
+  '.bio | contains("Pacific Northwest")'
+
+# Test Case 17: Underscore Sanitization
+request GET "/author/Nyron_Bovell" 200 "17. Underscore Sanitization" \
+  '.name == "Nyron Bovell" and .source == "google_books"'
+
+# Test Case 18: Bio Miner vs Placeholder (Safety Check)
+request GET "/author/Megan%20Bledsoe" 200 "18. Bio Miner vs Placeholder Check" \
+  '.bio | length > 60'
+
+# -----------------------------------------------------------------------------
+# 13. Attribution & LOC Search (v4.2 - v4.3)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v4.2+ Attribution & LOC Search...${NC}"
+
+# Test Case 19: Source Attribution (Merge)
+request GET "/book/isbn/9780441172719" 200 "19. Source Attribution (Dune)" \
+  '.data_sources | index("Google Books") != null and index("Open Library") != null'
+
+# Test Case 20: LOC Search Integration
+# Logic: Search for a known LOC document. Assert LOC is in the sources.
+request GET "/search?q=13th+Amendment" 200 "20. LOC Search Integration" \
+  '.results | any(.data_sources | index("Library of Congress") != null)'
+
+# -----------------------------------------------------------------------------
+# 14. Universal ID Lookup (v4.4)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v4.4 Universal ID Lookup...${NC}"
+
+# Test Case 21: Universal ID (LCCN Lookup)
+# Logic: Look up Pride and Prejudice via LCCN (2013657690). 
+# Assert we get a title, and the data source is LOC.
+request GET "/book/isbn/2013657690" 200 "21. Universal ID (LCCN Lookup)" \
+  '.title | contains("Pride") and (.data_sources | index("Library of Congress") != null)'
+
+# Test Case 22: Detailed LOC Validation
+request GET "/book/isbn/2013657690" 200 "22. Detailed LOC Validation" \
+  '.lccn[0] == "2013657690" and .authors[0].name != null'
+
+
+# -----------------------------------------------------------------------------
+# 15. Cache Performance
 # -----------------------------------------------------------------------------
 echo -e "${YELLOW}Cache cold vs hot test${NC}"
-TEST_ISBN="9780140449136" # Crime and Punishment
+TEST_ISBN="9780140449136"
 printf "Cold → "
 cold=$(curl -s -L -o /dev/null -w "%{time_total}" "$BASE_URL/book/isbn/$TEST_ISBN")
 echo "${cold}s"
@@ -215,7 +296,7 @@ echo -e "\n${YELLOW}╔═══════════════════
 echo -e "Total: $TOTAL | Passed: ${GREEN}$PASSED${NC} | Failed: ${RED}$FAILED${NC}"
 
 if [[ $FAILED -eq 0 ]]; then
-  echo -e "\n${GREEN}All tests passed — Backend v2.1.1 is Solid!${NC}\n"
+  echo -e "\n${GREEN}All tests passed — Backend v4.5 is Solid!${NC}\n"
   exit 0
 else
   echo -e "\n${RED}Some tests failed — see above${NC}\n"

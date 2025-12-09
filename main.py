@@ -1,4 +1,4 @@
-# (v2.1.1) - LoC Shield + Keyword Purge + Metadata Resolver
+# (v4.6.0) - Tri-Hybrid Architecture + Fixed ID Search Routing
 import os
 import httpx
 import asyncio
@@ -19,7 +19,7 @@ from slowapi.errors import RateLimitExceeded
 from loguru import logger
 import fiction
 import non_fiction
-import loc # NEW: Library of Congress Service
+import loc 
 
 # --------------------------------------------------------------------
 # 1. Configuration & Setup
@@ -34,19 +34,17 @@ logger.add(
     format="{time} {level} {message}",
 )
 
-# Robustly load .env from the same directory as main.py
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# Initialize Rate Limiter with Redis storage
 limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL, default_limits=["100/minute"])
 
 app = FastAPI(
     title="Bookfinder Intelligent API",
     description="A robust, heuristic-driven book API with automated tagging, series detection, and deep mining.",
-    version="2.1.1" 
+    version="4.6.0" 
 )
 
 app.state.limiter = limiter
@@ -56,6 +54,20 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
 OPEN_LIBRARY_API_URL = "https://openlibrary.org"
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+
+# --- DATA HYGIENE: The Blacklist ---
+TITLE_BLACKLIST = [
+    "cloud mountain",
+    "the great gatsby",
+    "1984",
+    "animal farm",
+    "pride and prejudice",
+    "the hobbit",
+    "little women",
+    "me before you", 
+    "the dead zone"
+]
 
 try:
     cache = Redis.from_url(REDIS_URL, decode_responses=True, encoding="utf-8")
@@ -83,7 +95,7 @@ async def cached_get(
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, params=filtered_params, timeout=20.0)
-            if resp.status_code == 404: return {} # Handle 404 gracefully
+            if resp.status_code == 404: return {} 
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPError as e:
@@ -173,9 +185,8 @@ class MergedBook(BaseModel):
     format_tag: Optional[str] = None
     related_isbns: List[str] = Field(default_factory=list)
     content_flag: Optional[str] = None
-    
-    # Metadata Source Tracking
-    data_source: str = "hybrid" 
+    data_source: str = "hybrid"
+    data_sources: List[str] = Field(default_factory=list)
 
 class SearchResultItem(BaseModel):
     title: str
@@ -193,6 +204,9 @@ class SearchResultItem(BaseModel):
     cover_url: Optional[str] = None
     series: Optional[SeriesInfo] = None
     format_tag: Optional[str] = None
+    description: Optional[str] = None
+    data_sources: List[str] = Field(default_factory=list)
+    lccn: List[str] = Field(default_factory=list) # Added LCCN field to SearchResultItem
 
 class HybridSearchResponse(BaseModel):
     query: str
@@ -204,6 +218,16 @@ class NewReleasesResponse(BaseModel):
     subject: Optional[str] = None
     num_found: int
     results: List[SearchResultItem]
+
+class AuthorPageData(BaseModel):
+    key: str
+    name: str
+    bio: Optional[str] = None
+    birth_date: Optional[str] = None
+    death_date: Optional[str] = None
+    photo_url: Optional[str] = None
+    books: List[SearchResultItem] = Field(default_factory=list)
+    source: str 
 
 class AuthorBio(BaseModel):
     value: str
@@ -263,7 +287,7 @@ def generate_high_res_url(url: Optional[str]) -> Optional[str]:
 
 def clean_html_text(text: Optional[str]) -> Optional[str]:
     if not text: return None
-    clean = re.sub(r'<[^>]+>', '', text)
+    clean = re.sub(r'<[^>]+>', ' ', text)
     clean = clean.replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&")
     return re.sub(r'\s+', ' ', clean).strip()
 
@@ -301,7 +325,6 @@ def check_content_safety(description: Optional[str], categories: List[str]) -> O
     return None
 
 def heuristic_tagging(text: str, existing_tags: List[str]) -> List[str]:
-    # PURGED: Removed weak triggers ("love", "history", "code", "future")
     GENRE_KEYWORDS = {
         "vampire": "Paranormal", "werewolf": "Paranormal", "witch": "Fantasy",
         "space": "Sci-Fi", "alien": "Sci-Fi", "robot": "Sci-Fi", 
@@ -369,13 +392,21 @@ def _convert_isbn10_to_isbn13(isbn10: str) -> str:
     return f"{base}{check_digit}"
 
 def validate_and_clean_isbn(isbn: str = FastAPIPath(...)) -> str:
-    cleaned_isbn = re.sub(r"[\s-]+", "", isbn)
-    if len(cleaned_isbn) == 13:
-        if _is_valid_isbn13_checksum(cleaned_isbn): return cleaned_isbn
-        raise HTTPException(status_code=400, detail="Invalid ISBN.")
-    elif len(cleaned_isbn) == 10 and _is_valid_isbn10_checksum(cleaned_isbn):
-        return _convert_isbn10_to_isbn13(cleaned_isbn)
-    raise HTTPException(status_code=400, detail="Invalid ISBN.")
+    # 1. Clean input
+    cleaned = re.sub(r"[\s-]+", "", isbn)
+    
+    # 2. ISBN 13 Check
+    if len(cleaned) == 13 and _is_valid_isbn13_checksum(cleaned): return cleaned
+    
+    # 3. ISBN 10 Check -> Convert
+    if len(cleaned) == 10 and _is_valid_isbn10_checksum(cleaned): return _convert_isbn10_to_isbn13(cleaned)
+    
+    # 4. LCCN Fallback (Must be numeric and 8+ digits)
+    if cleaned.isdigit() and len(cleaned) >= 8:
+        return cleaned 
+        
+    # 5. Fail
+    raise HTTPException(status_code=400, detail="Invalid ISBN or Identifier.")
 
 def _get_isbns_from_google_item(item: Dict[str, Any]) -> (Optional[str], Optional[str]):
     isbn_13, isbn_10 = None, None
@@ -401,7 +432,6 @@ def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
     links = g_info.get("imageLinks", {})
     raw_thumbnail = ensure_https(links.get("thumbnail"))
     
-    # Optimistic URL generation for High-Res URLs (Frontend handles filtering)
     extra_large = ensure_https(links.get("extraLarge"))
     if not extra_large and raw_thumbnail: extra_large = generate_high_res_url(raw_thumbnail)
     
@@ -417,7 +447,6 @@ def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         extraLarge=extra_large
     )
     
-    # For List/Search view, prioritize thumbnails.
     cover_url = g_covers.thumbnail or g_covers.smallThumbnail or g_covers.small or g_covers.medium
 
     if not cover_url:
@@ -450,12 +479,13 @@ def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         google_book_id=item.get("id"),
         cover_url=cover_url,
         series=series,
-        format_tag=fmt
+        format_tag=fmt,
+        description=g_info.get("description"),
+        data_sources=["Google Books"] 
     )
 
 def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
     isbn_13, isbn_10 = _get_isbns_from_ol_item(item)
-    cover_id = isbn_13 if isbn_13 else isbn_10
     
     raw_names = item.get("author_name", [])
     raw_keys = item.get("author_key", [])
@@ -481,44 +511,86 @@ def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         published_date=pub_date,
         categories=smart_cats,
         open_library_work_id=item.get("key"),
-        cover_url=cover_url
+        cover_url=cover_url,
+        data_sources=["Open Library"]
+    )
+
+# NEW: LOC Mapper (Fixed)
+def _loc_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
+    raw_authors = item.get("authors", [])
+    # Handle list of dicts or list of strings
+    author_objects = []
+    for a in raw_authors:
+        if isinstance(a, dict):
+            author_objects.append(AuthorItem(name=a.get("name", "Unknown")))
+        elif isinstance(a, str):
+            author_objects.append(AuthorItem(name=a))
+
+    return SearchResultItem(
+        title=item.get("title", "Untitled Document"),
+        subtitle=item.get("description")[:100] if item.get("description") else None,
+        authors=author_objects,
+        published_date=item.get("published_date"),
+        publisher=item.get("publisher"),
+        isbn_13=None, 
+        categories=item.get("subjects", []),
+        description=item.get("description"),
+        format_tag="Primary Source",
+        data_sources=["Library of Congress"],
+        lccn=item.get("lccn") # PASS LCCN
     )
 
 def _merge_and_deduplicate_results(
     google_results: List[SearchResultItem],
-    ol_results: List[SearchResultItem]
+    ol_results: List[SearchResultItem],
+    loc_results: List[Dict[str, Any]] = [] # Now accepts raw dicts
 ) -> List[SearchResultItem]:
     merged_books: Dict[str, SearchResultItem] = {}
     
     def get_fallback_key(item: SearchResultItem):
-        if not item.authors: return None
+        if not item.authors: return f"noauth-{item.title.lower().strip()}"
         return f"{item.title.lower().strip()}|{item.authors[0].name.lower().strip()}"
 
+    # 1. Process Google
     for item in google_results:
         key = item.isbn_13 or get_fallback_key(item)
         if key: merged_books[key] = item
 
+    # 2. Process Open Library
     for item in ol_results:
-        key = item.isbn_13 or get_fallback_key(item) or item.open_library_work_id
+        key = item.isbn_13 or get_fallback_key(item)
         if not key: continue
 
         if key in merged_books:
             existing = merged_books[key]
             if not existing.open_library_work_id: existing.open_library_work_id = item.open_library_work_id
             if not existing.authors and item.authors: existing.authors = item.authors
-            if not existing.published_date and item.published_date: existing.published_date = item.published_date
-            if not existing.cover_url and item.cover_url: existing.cover_url = item.cover_url
-            
-            combined_subjects = set(existing.categories + item.categories)
-            existing.categories = sorted(list(combined_subjects))
+            if "Open Library" not in existing.data_sources:
+                 existing.data_sources.append("Open Library")
         else:
             merged_books[key] = item
+
+    # 3. Process LOC
+    clean_loc_results = [_loc_item_to_search_result(item) for item in loc_results]
+
+    for item in clean_loc_results:
+        key = get_fallback_key(item) 
+        if key in merged_books:
+             existing = merged_books[key]
+             if "Library of Congress" not in existing.data_sources:
+                 existing.data_sources.append("Library of Congress")
+             existing.format_tag = "Primary Source"
+             # Update LCCN if missing
+             if item.lccn and not existing.lccn:
+                 existing.lccn = item.lccn
+        else:
+             merged_books[key] = item
 
     def score_book(book: SearchResultItem) -> int:
         score = 0
         if book.cover_url: score += 10
         if book.isbn_13: score += 5
-        if book.average_rating: score += 2
+        if "Library of Congress" in book.data_sources: score += 3 
         if book.published_date: score += 1
         return score
 
@@ -571,39 +643,16 @@ async def search_open_library(q: str, limit: int, offset: int, subject: Optional
         "q": q, 
         "limit": limit, 
         "offset": offset,
-        "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject,first_publish_year,cover_i", # Request cover_i
+        "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject,first_publish_year,cover_i", 
         "subject": subject,
         "language": "eng" 
     }
     data = await cached_get(f"{OPEN_LIBRARY_API_URL}/search.json", params)
     return [_ol_item_to_search_result(item) for item in data.get("docs", [])]
 
-# DEPRECATED for direct new-releases to avoid "1998 reprint" issue
-async def get_google_new_releases(limit: int, start_index: int, subject: Optional[str] = None) -> List[SearchResultItem]:
-    if not API_KEY: return []
-    FIELDS = "items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,averageRating,ratingsCount,categories,imageLinks(thumbnail,small),industryIdentifiers,description,pageCount))"
-    query_string = f"subject:{subject}" if subject else "*"
-    params = {
-        "q": query_string, 
-        "orderBy": "newest", 
-        "key": API_KEY, 
-        "maxResults": limit,
-        "startIndex": start_index,
-        "langRestrict": "en",
-        "fields": FIELDS
-    }
-    # Cache for only 1 hour
-    data = await cached_get(GOOGLE_BOOKS_API_URL, params, timeout_seconds=3600)
-    return [_google_item_to_search_result(item) for item in data.get("items", [])]
-
-# UPDATED: Strict Date Filter & Open Library Priority
 async def get_open_library_new_releases(limit: int, offset: int, subject: Optional[str] = None) -> List[SearchResultItem]:
-    # Dynamic Year Logic: Ensure we only get "True New" books (Current Year - 1 to Future)
-    # This filters out the 1998 reprints that Google was returning.
     current_year = datetime.now().year
     start_year = current_year - 1
-    
-    # Construct Strict Query: subject + date range
     base_query = f"subject:{subject}" if subject else "language:eng"
     date_query = f"first_publish_year:[{start_year} TO *]"
     final_query = f"{base_query} {date_query}"
@@ -615,8 +664,6 @@ async def get_open_library_new_releases(limit: int, offset: int, subject: Option
         "offset": offset,
         "fields": "title,subtitle,author_name,author_key,isbn,key,publisher,subject,first_publish_year,cover_i", 
     }
-    
-    # Cache for only 1 hour
     data = await cached_get(f"{OPEN_LIBRARY_API_URL}/search.json", params, timeout_seconds=3600)
     return [_ol_item_to_search_result(item) for item in data.get("docs", [])]
 
@@ -627,7 +674,46 @@ async def get_open_library_work_editions(work_key: str) -> dict:
     url = f"{OPEN_LIBRARY_API_URL}/works/{work_key}/editions.json"
     return await cached_get(url, params={"limit": 50})
 
-# Health Checks (Unchanged)
+async def get_wikidata_profile(author_name: str) -> Optional[Dict[str, Any]]:
+    query = """
+    SELECT ?author ?authorLabel ?bio ?birthDate ?deathDate ?image WHERE {
+      ?author wdt:P31 wd:Q5;          # Instance of human
+              wdt:P106 wd:Q36180;     # Occupation: writer
+              rdfs:label ?authorLabel.
+      FILTER(LANG(?authorLabel) = "en").
+      FILTER(LCASE(?authorLabel) = LCASE("%s")).
+      OPTIONAL { ?author wdt:P569 ?birthDate. }
+      OPTIONAL { ?author wdt:P570 ?deathDate. }
+      OPTIONAL { ?author wdt:P18 ?image. }
+      OPTIONAL { ?author schema:description ?bio. FILTER(LANG(?bio) = "en") }
+    } LIMIT 1
+    """ % author_name.replace('"', '\\"')
+
+    params = {"query": query, "format": "json"}
+    headers = {
+        "User-Agent": "Bookfinder/4.0 (https://bookfinder.example.com; contact@example.com)" 
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(WIKIDATA_SPARQL_URL, params=params, headers=headers, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                bindings = data.get("results", {}).get("bindings", [])
+                if bindings:
+                    res = bindings[0]
+                    return {
+                        "bio": res.get("bio", {}).get("value"),
+                        "birth_date": res.get("birthDate", {}).get("value"),
+                        "death_date": res.get("deathDate", {}).get("value"),
+                        "photo_url": res.get("image", {}).get("value")
+                    }
+    except Exception as e:
+        logger.warning(f"Wikidata query failed for {author_name}: {e}")
+    
+    return None
+
+# Health Checks
 async def check_redis_health() -> ServiceHealth:
     if not cache: return ServiceHealth(name="redis", status="error", detail="Redis client not initialized.")
     try:
@@ -680,7 +766,7 @@ async def get_cache_stats(request: Request, admin: bool = Depends(get_admin_key)
         return CacheStats(status="error", key_count=0, used_memory="0B", redis_url=f"Error: {str(e)}")
 
 @app.get("/")
-async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v2.0.4 is running!"}
+async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v4.6.0 is running!"}
 
 @app.get("/genres/fiction", response_model=List[fiction.Genre])
 @limiter.limit("20/minute")
@@ -690,52 +776,58 @@ async def get_fiction_genres(request: Request): return fiction.FICTION_GENRES
 @limiter.limit("20/minute")
 async def get_non_fiction_genres(request: Request): return non_fiction.NON_FICTION_GENRES
 
-# NEW: Helper to merge LoC Data
 def _merge_loc_data(book: MergedBook, loc_data: dict) -> MergedBook:
     if not loc_data:
         return book
-    
-    # 1. Date Priority: LoC > Google/OL
     if loc_data.get("published_date"):
         book.published_date = loc_data["published_date"]
-    
-    # 2. Subjects Priority: Merge LoC subjects into existing list
     if loc_data.get("subjects"):
-        # Combine and deduplicate
         combined = set(book.subjects + loc_data["subjects"])
         book.subjects = sorted(list(combined))
-        
-    # 3. Publisher
     if not book.publisher and loc_data.get("publisher"):
         book.publisher = loc_data["publisher"]
+    
+    # Attribution
+    if book.data_sources is not None and "Library of Congress" not in book.data_sources:
+        book.data_sources.append("Library of Congress")
         
     return book
 
+# NEW: Unified Book/ID Handler (Fixed Variable Scope)
 @app.get("/book/isbn/{isbn}", response_model=MergedBook, tags=["Books"])
 @limiter.limit("100/minute")
 async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_clean_isbn)):
-    # TRI-FORCE FETCH: Google, Open Library, and Library of Congress
-    google_volume, open_library_book, loc_data = await asyncio.gather(
-        get_google_data_by_isbn(isbn),
-        get_open_library_data_by_isbn(isbn),
-        loc.get_loc_data_by_isbn(isbn) # New Service Call
-    )
+    # 1. Determine ID Type
+    is_lccn = len(isbn) < 13 and isbn.isdigit()
+    
+    # 2. Strategy Split
+    if is_lccn:
+        # LCCN Mode: Only query LOC (using Item endpoint)
+        google_volume, open_library_book, loc_data = await asyncio.gather(
+            asyncio.sleep(0, result={}),
+            asyncio.sleep(0, result={}),
+            loc.get_loc_data_by_lccn(isbn) # Uses the new Item lookup!
+        )
+    else:
+        # Standard ISBN Mode: Query All
+        google_volume, open_library_book, loc_data = await asyncio.gather(
+            get_google_data_by_isbn(isbn),
+            get_open_library_data_by_isbn(isbn),
+            loc.get_loc_data_by_isbn(isbn)
+        )
     
     if not google_volume and not open_library_book and not loc_data:
         raise HTTPException(status_code=404, detail="Book not found.")
 
     g_info = google_volume.get("volumeInfo", {})
-    
     description = clean_html_text(g_info.get("description"))
     if not description:
         desc_raw = open_library_book.get("description")
         if isinstance(desc_raw, dict): description = clean_html_text(desc_raw.get("value"))
         elif isinstance(desc_raw, str): description = clean_html_text(desc_raw)
-        # Fallback to LoC description
         if not description and loc_data.get("description"):
             description = clean_html_text(loc_data["description"])
     
-    # ... (Keep existing async task logic for OL Works/Authors) ...
     tasks = []
     work_key = None
     ol_works = open_library_book.get("works", [])
@@ -752,12 +844,10 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         elif "key" in a: author_keys_to_fetch.append(a["key"])
     
     author_fetch_tasks = [get_open_library_author(k) for k in author_keys_to_fetch[:3]]
-    
     secondary_results = await asyncio.gather(tasks[0], *author_fetch_tasks)
     work_data = secondary_results[0] if work_key else None
     author_details_list = secondary_results[1:]
 
-    # ... (Keep existing category/author merging logic) ...
     if not description and work_data:
         raw_desc = work_data.get("description")
         if isinstance(raw_desc, dict): description = clean_html_text(raw_desc.get("value"))
@@ -775,13 +865,9 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
     clean_work_tags = _process_rich_categories(work_tags)
     combined_subjects = sorted(list(set(clean_g_categories + clean_ol_subjects + clean_work_tags)))
     
-    # --- MODIFIED: LoC SHIELD LOGIC ---
-    # If LoC provided authoritative subjects, we skip heuristic tagging entirely.
     has_loc_subjects = loc_data and loc_data.get("subjects")
-
     if not has_loc_subjects and len(combined_subjects) < 3 and description:
         combined_subjects = sorted(list(set(combined_subjects + heuristic_tagging(description + " " + g_info.get("title", ""), combined_subjects))))
-    # --- END MODIFICATION ---
 
     author_bio_map = {}
     for ad in author_details_list:
@@ -804,8 +890,14 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
     if not final_authors:
         final_authors = [AuthorItem(name=a, key=None) for a in g_info.get("authors", [])]
 
-    isbn_10 = next((i["identifier"] for i in g_info.get("industryIdentifiers", []) if i["type"] == "ISBN_10"), None)
-    related_isbns = [i["identifier"] for i in g_info.get("industryIdentifiers", [])]
+    # Initialize variables to avoid scope errors
+    isbn_10 = None
+    related_isbns = []
+    
+    if g_info.get("industryIdentifiers"):
+        isbn_10 = next((i["identifier"] for i in g_info.get("industryIdentifiers", []) if i["type"] == "ISBN_10"), None)
+        related_isbns = [i["identifier"] for i in g_info.get("industryIdentifiers", [])]
+        
     is_ebook = google_volume.get("saleInfo", {}).get("isEbook", False)
     fmt = classify_format(g_info.get("pageCount"), is_ebook)
     content_flag = check_content_safety(description, combined_subjects)
@@ -817,14 +909,10 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         large=ensure_https(f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg")
     )
     
-    # RESTORED: Optimistic URL generation for High-Res URLs.
-    # Relies on Proxy to filter out ghosts.
     links = g_info.get("imageLinks", {})
     raw_thumbnail = ensure_https(links.get("thumbnail"))
-    
     extra_large = ensure_https(links.get("extraLarge"))
     if not extra_large and raw_thumbnail: extra_large = generate_high_res_url(raw_thumbnail)
-    
     large = ensure_https(links.get("large"))
     if not large and raw_thumbnail: large = generate_high_res_url(raw_thumbnail)
 
@@ -837,19 +925,22 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         extraLarge=extra_large
     )
     
-    # For List/Search view, prioritize thumbnails.
     cover_url = g_covers.thumbnail or g_covers.smallThumbnail or g_covers.small or g_covers.medium
-
     if not cover_url:
-        # FIX: use the argument 'isbn' instead of 'isbn_13' (which wasn't defined in this scope)
-        cover_id = isbn if isbn else isbn_10
-        if cover_id: cover_url = f"https://covers.openlibrary.org/b/isbn/{cover_id}-M.jpg"
+        # Use the passed ID for cover lookup fallback
+        if isbn: cover_url = f"https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg"
 
+    sources = []
+    if google_volume: sources.append("Google Books")
+    if open_library_book: sources.append("Open Library")
+    if loc_data: sources.append("Library of Congress")
+
+    # FIX: Correct instantiation of MergedBook (Robust Variable Scope)
     merged_book = MergedBook(
         title=g_info.get("title", open_library_book.get("title", "Title Not Found")),
         subtitle=g_info.get("subtitle"),
         authors=final_authors,
-        isbn_13=isbn,
+        isbn_13=isbn, # Use the requested ID as the primary key
         isbn_10=isbn_10,
         google_book_id=google_volume.get("id"),
         description=description,
@@ -869,44 +960,249 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         format_tag=fmt,
         related_isbns=related_isbns,
         content_flag=content_flag,
-        data_source="hybrid"
+        data_source="hybrid",
+        data_sources=sources
     )
     
-    # 6. Apply LoC Authority Overrides
     return _merge_loc_data(merged_book, loc_data)
+
+# --- NEW: Helper to identify LCCN queries ---
+def _is_lccn(q: str) -> bool:
+    clean = q.replace("-", "").strip()
+    return clean.isdigit() and 8 <= len(clean) <= 12
 
 @app.get("/search", response_model=HybridSearchResponse, tags=["Books"])
 @limiter.limit("60/minute")
 async def search_hybrid(request: Request, q: str, subject: Optional[str] = None, limit: int = 10, start_index: int = 0):
-    google_results, ol_results = await asyncio.gather(
-        search_google(q, limit, start_index, subject), 
-        search_open_library(q, limit, start_index, subject)
+    
+    # 1. Determine Search Mode based on Input Type
+    is_id_search = _is_lccn(q)
+    
+    # Use helper list to wrap single result into list for merge function
+    def wrap_in_list(item):
+        return [item] if item else []
+
+    if is_id_search:
+        logger.info(f"Detected LCCN-like query: {q}. Switching to ID search mode.")
+        google_task = asyncio.sleep(0, result=[]) # Skip Google for ID search
+        ol_task = asyncio.sleep(0, result=[]) # Skip OL for ID search
+        
+        # Use Item Lookup (get_loc_data_by_lccn) but wrap it in a task that returns a list
+        # We need an async wrapper because get_loc_data_by_lccn returns Dict, not List[Dict]
+        async def loc_id_wrapper(lccn_id):
+            res = await loc.get_loc_data_by_lccn(lccn_id)
+            return [res] if res else []
+            
+        loc_task = loc_id_wrapper(q)
+    else:
+        google_task = search_google(q, limit, start_index, subject)
+        ol_task = search_open_library(q, limit, start_index, subject)
+        loc_task = loc.search_loc(q, limit)
+
+    # 2. Execute Parallel Search
+    google_results, ol_results, loc_results = await asyncio.gather(
+        google_task, 
+        ol_task, 
+        loc_task
     )
-    final_results = _merge_and_deduplicate_results(google_results, ol_results)
+    
+    # 3. Merge
+    final_results = _merge_and_deduplicate_results(google_results, ol_results, loc_results)
     return HybridSearchResponse(query=q, subject=subject, num_found=len(final_results), results=final_results)
 
+# --- QUALITY GATE HELPER ---
+def _is_valid_release(book: SearchResultItem) -> bool:
+    if not book.cover_url: return False
+    if not book.isbn_13 and not book.isbn_10: return False
+    if not book.authors or book.authors[0].name == "Unknown": return False
+    lower_title = book.title.lower()
+    if "<" in lower_title or "{" in lower_title or len(lower_title) > 150: return False
+    if any(banned in lower_title for banned in TITLE_BLACKLIST): return False
+    reprint_triggers = ["anniversary edition", "classic", "reissue", "reprint"]
+    if any(trigger in lower_title for trigger in reprint_triggers): return False
+    if not book.published_date: return False
+    try:
+        match = re.search(r"(\d{4})", book.published_date)
+        if not match: return False
+        year = int(match.group(1))
+        current_year = datetime.now().year
+        if year < (current_year - 1): return False
+    except:
+        return False
+    return True
+
+# --- THE DEEP DREDGE ENDPOINT ---
 @app.get("/new-releases", response_model=NewReleasesResponse, tags=["Books"])
 @limiter.limit("30/minute")
 async def get_new_releases(request: Request, subject: Optional[str] = None, limit: int = 10, start_index: int = 0):
-    # Only query Open Library for "True New" books (Strict Date Filter)
-    ol_results = await get_open_library_new_releases(limit, start_index, subject)
-    
-    # Filter out "Anniversary" and "Reissue" titles
     valid_books = []
-    for book in ol_results:
-        if re.search(r"(anniversary|reissue|reprint|centennial)", book.title, re.IGNORECASE):
-            continue
-        valid_books.append(book)
+    current_offset = start_index
+    depth = 0
+    MAX_DEPTH = 5
+    INTERNAL_BATCH_SIZE = 40 
+    
+    while len(valid_books) < limit and depth < MAX_DEPTH:
+        ol_results = await get_open_library_new_releases(limit=INTERNAL_BATCH_SIZE, offset=current_offset, subject=subject)
+        
+        if not ol_results:
+            break
+            
+        for book in ol_results:
+            if not book.cover_url:
+                isbn = book.isbn_13 or book.isbn_10
+                if isbn:
+                    try:
+                        g_data = await get_google_data_by_isbn(isbn)
+                        g_images = g_data.get("volumeInfo", {}).get("imageLinks", {})
+                        rescued_cover = g_images.get("thumbnail") or g_images.get("smallThumbnail")
+                        if rescued_cover:
+                            book.cover_url = ensure_https(rescued_cover)
+                    except Exception as e:
+                        pass
+            
+            if _is_valid_release(book):
+                valid_books.append(book)
+                
+        current_offset += INTERNAL_BATCH_SIZE
+        depth += 1
+    
+    unique_books = {}
+    for b in valid_books:
+        k = b.isbn_13 or b.isbn_10 or b.title
+        if k not in unique_books:
+            unique_books[k] = b
+            
+    final_list = list(unique_books.values())[:limit]
 
-    return NewReleasesResponse(subject=subject, num_found=len(valid_books), results=valid_books)
+    return NewReleasesResponse(subject=subject, num_found=len(final_list), results=final_list)
 
-@app.get("/author/{author_key}", response_model=AuthorDetails, tags=["Discovery"])
+def _mine_bio_from_books(author_name: str, books: List[SearchResultItem]) -> Optional[str]:
+    name_parts = author_name.split()
+    last_name = name_parts[-1] if name_parts else ""
+    bio_signals = [
+        "lives in", "based in", "resides in", "grew up", "born in", "currently", 
+        "author of", "writer", "books include", "works include", "novels include",
+        "award", "bestselling", "degree", "university", "graduate"
+    ]
+    pronouns = [" he ", " she ", " they ", " her ", " his ", " their "]
+
+    for book in books:
+        raw_desc = book.description
+        if not raw_desc: continue
+        desc = clean_html_text(raw_desc) or ""
+        logger.info(f"Scanning book: {book.title} for bio...")
+        chunks = re.split(r'\.\s+(?=[A-Z])', desc)
+        chunks = [c.strip() for c in chunks if len(c) > 20]
+        if not chunks: continue
+        tail_chunks = chunks[-5:] 
+        for chunk in reversed(tail_chunks):
+            score = 0
+            lower_chunk = chunk.lower()
+            if author_name.lower() in lower_chunk: score += 3
+            elif last_name.lower() in lower_chunk: score += 1
+            if any(signal in lower_chunk for signal in bio_signals): score += 2
+            if any(p in lower_chunk for p in pronouns): score += 1
+            if "copyright" in lower_chunk or "rights reserved" in lower_chunk: score -= 5
+            if "published by" in lower_chunk: score -= 2
+            if score >= 3:
+                logger.info(f"Bio found via heuristic scorer in {book.title} (score: {score})")
+                return chunk
+        tail_len = 1000
+        tail = desc[-tail_len:] if len(desc) > tail_len else desc
+        match = re.search(f"({re.escape(author_name)}.*)", tail, re.IGNORECASE | re.DOTALL)
+        if match:
+             candidate = match.group(1).strip()
+             if len(candidate) > len(author_name) + 10:
+                 logger.info(f"Bio found via Tail Search in {book.title}")
+                 return candidate
+    return None
+
+def _generate_dynamic_bio(name: str, books: List[SearchResultItem]) -> str:
+    if not books:
+        return f"{name} is a featured author in our collection."
+    genre_counts = {}
+    for book in books:
+        for cat in book.categories:
+            genre_counts[cat] = genre_counts.get(cat, 0) + 1
+    top_genre = "Contemporary Fiction"
+    if genre_counts:
+        top_genre = max(genre_counts, key=genre_counts.get) 
+    titles = [f"'{b.title}'" for b in books[:2]]
+    works_str = " and ".join(titles)
+    return f"{name} is a writer known for {top_genre}. Notable works include {works_str}."
+
+@app.get("/author/{id}", response_model=AuthorPageData, tags=["Discovery"])
 @limiter.limit("100/minute")
-async def get_author(request: Request, author_key: str):
-    if not (author_key.startswith("OL") and author_key.endswith("A")): raise HTTPException(status_code=400, detail="Invalid author key.")
-    author_data = await get_open_library_author(author_key)
-    if not author_data: raise HTTPException(status_code=404, detail="Author not found.")
-    return AuthorDetails(**author_data)
+async def get_author_profile(request: Request, id: str):
+    if id.startswith("OL") and id.endswith("A"):
+        try:
+            author_data = await get_open_library_author(id)
+            if not author_data:
+                raise HTTPException(status_code=404, detail="Author not found.")
+        except Exception:
+            raise HTTPException(status_code=404, detail="Author not found.")
+        works_results = await search_open_library(q=f"author_key:{id}", limit=20, offset=0)
+        photo_url = None
+        if "photos" in author_data and author_data["photos"]:
+             photo_id = author_data["photos"][0]
+             if photo_id > 0:
+                 photo_url = f"https://covers.openlibrary.org/a/id/{photo_id}-L.jpg"
+        bio_text = None
+        if "bio" in author_data:
+            bio_val = author_data["bio"]
+            if isinstance(bio_val, dict):
+                bio_text = bio_val.get("value")
+            else:
+                bio_text = str(bio_val)
+        return AuthorPageData(
+            key=id,
+            name=author_data.get("name", "Unknown Author"),
+            bio=clean_html_text(bio_text),
+            birth_date=author_data.get("birth_date"),
+            death_date=author_data.get("death_date"),
+            photo_url=photo_url,
+            books=works_results,
+            source="open_library"
+        )
+    else:
+        clean_name = id.replace('"', '').replace('_', ' ').strip()
+        google_results = await search_google(q=f'inauthor:"{clean_name}"', limit=20, start_index=0)
+        if not google_results:
+             google_results = await search_google(q=f'inauthor:{clean_name}', limit=20, start_index=0)
+        if not google_results:
+             raise HTTPException(status_code=404, detail=f"Author '{clean_name}' not found.")
+        display_name = clean_name
+        if google_results and google_results[0].authors:
+             display_name = google_results[0].authors[0].name
+        wikidata_profile = await get_wikidata_profile(display_name)
+        if wikidata_profile:
+             return AuthorPageData(
+                key=id,
+                name=display_name,
+                bio=wikidata_profile.get("bio") or "Wikidata bio unavailable.",
+                birth_date=wikidata_profile.get("birth_date"),
+                death_date=wikidata_profile.get("death_date"),
+                photo_url=wikidata_profile.get("photo_url"),
+                books=google_results,
+                source="open_library" 
+             )
+        mined_bio = _mine_bio_from_books(display_name, google_results)
+        if mined_bio:
+             return AuthorPageData(
+                key=id,
+                name=display_name,
+                bio=mined_bio,
+                books=google_results,
+                source="google_books"
+             )
+        dynamic_bio = _generate_dynamic_bio(display_name, google_results)
+        return AuthorPageData(
+            key=id, 
+            name=display_name,
+            bio=dynamic_bio,
+            books=google_results,
+            source="google_books"
+        )
 
 @app.get("/work/{work_key}", response_model=WorkEditionsResponse, tags=["Discovery"])
 @limiter.limit("100/minute")
