@@ -268,7 +268,28 @@ request GET "/book/isbn/2013657690" 200 "21. Universal ID (LCCN Lookup)" \
 request GET "/book/isbn/2013657690" 200 "22. Detailed LOC Validation" \
   '.lccn[0] == "2013657690" and .authors[0].name != null'
 
+# Test Case 23: LCCN Lookup Test (Pride and Prejudice)
+# Logic: Verify that searching by LCCN (2011287276) returns "Pride and prejudice" and "Oxford University Press".
+request GET "/book/isbn/2011287276" 200 "23. LCCN Lookup (Pride and Prejudice)" \
+  '.title == "Pride and prejudice" and .publisher == "Oxford University Press"'
 
+# -----------------------------------------------------------------------------
+# 16. Indie Author Rescue & Relevance Boosting (v4.7)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing Indie Rescue & Relevance Boosting...${NC}"
+
+# Test Case 24: Title Match Boost (Girl, Incorrupted)
+# Logic: Search for "Girl, Incorrupted". The exact title match logic (+500 pts) 
+# should force it to result #0, beating "Girl, Interrupted".
+request GET "/search?q=Girl%2C+Incorrupted" 200 "24. Title Match Boost (Girl, Incorrupted)" \
+  '.results[0].title == "Girl, Incorrupted"'
+
+# Test Case 25: Author Authority Boost
+# Logic: Search for "George Orwell". Books BY him (+600 pts) should rank higher 
+# than biographies ABOUT him.
+request GET "/search?q=George+Orwell" 200 "25. Author Authority Boost (George Orwell)" \
+  '.results[0].authors | any(.name | test("George Orwell"))'
+    
 # -----------------------------------------------------------------------------
 # 15. Cache Performance
 # -----------------------------------------------------------------------------

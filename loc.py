@@ -3,12 +3,19 @@ import re
 from typing import Optional, List, Dict, Any
 from loguru import logger
 
+# --- CONFIGURATION ---
 # Base for specific book lookups
 LOC_BOOK_API_BASE = "https://www.loc.gov/books"
-# Base for general searches
+# Base for general searches (manuscripts, legislation, etc.)
 LOC_SEARCH_API_BASE = "https://www.loc.gov/search"
-# Base for direct item retrieval (The Fix)
+# Base for direct item retrieval (The Fix for LCCNs)
 LOC_ITEM_API_BASE = "https://www.loc.gov/item"
+
+# HEADERS: Critical for avoiding 403/404 blocks from government APIs
+HEADERS = {
+    "User-Agent": "Bookfinder/4.0 (educational-research-tool; contact@example.com)",
+    "Accept": "application/json"
+}
 
 async def get_loc_data_by_isbn(isbn: str) -> Dict[str, Any]:
     """
@@ -22,7 +29,7 @@ async def get_loc_data_by_isbn(isbn: str) -> Dict[str, Any]:
     
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(LOC_BOOK_API_BASE, params=params, timeout=8.0)
+            resp = await client.get(LOC_BOOK_API_BASE, params=params, headers=HEADERS, timeout=10.0)
             if resp.status_code == 404:
                 return {}
             resp.raise_for_status()
@@ -32,32 +39,33 @@ async def get_loc_data_by_isbn(isbn: str) -> Dict[str, Any]:
             if not results:
                 return {}
             
+            # Use the first result (most relevant)
             item = results[0]
             return _normalize_loc_item(item)
             
-    except httpx.HTTPError as e:
+    except Exception as e:
         logger.warning(f"LoC API error for ISBN {isbn}: {e}")
         return {}
-    except Exception as e:
-        logger.error(f"Unexpected error fetching LoC data: {e}")
-        return {}
 
-# --- UPDATED: Specific Lookup by LCCN (Item Endpoint Strategy) ---
+# --- NEW: Specific Lookup by LCCN (Item Endpoint Strategy) ---
 async def get_loc_data_by_lccn(lccn: str) -> Dict[str, Any]:
     """
-    Fetches data using the Direct Item Endpoint.
+    Fetches bibliographic data using the Direct Item Endpoint.
     URL: https://www.loc.gov/item/{lccn}/?fo=json
     This is much more reliable than the search endpoint for specific IDs.
     """
-    url = f"{LOC_ITEM_API_BASE}/{lccn}/"
+    # Clean the LCCN just in case (remove whitespace)
+    clean_lccn = lccn.strip()
+    url = f"{LOC_ITEM_API_BASE}/{clean_lccn}/"
     params = {"fo": "json"}
     
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params=params, timeout=8.0)
+            resp = await client.get(url, params=params, headers=HEADERS, timeout=10.0)
             
             # If the ID doesn't exist, LOC returns 404
             if resp.status_code == 404:
+                logger.info(f"LOC: Item {clean_lccn} not found (404).")
                 return {}
                 
             resp.raise_for_status()
@@ -67,32 +75,32 @@ async def get_loc_data_by_lccn(lccn: str) -> Dict[str, Any]:
             # The data is inside "item" dict, not a "results" list.
             item_data = data.get("item", {})
             if not item_data:
+                logger.warning(f"LOC: Item {clean_lccn} returned valid JSON but no 'item' field.")
                 return {}
             
             return _normalize_loc_item(item_data)
             
-    except httpx.HTTPError as e:
-        logger.warning(f"LoC Item API error for LCCN {lccn}: {e}")
-        return {}
     except Exception as e:
-        logger.error(f"Unexpected error fetching LoC Item data: {e}")
+        logger.error(f"Error fetching LOC Item {lccn}: {e}")
         return {}
 
 # --- General Search Function for Researchers ---
 async def search_loc(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     """
-    Performs a general search on the Library of Congress.
+    Performs a general search on the Library of Congress (Documents, Legislation, etc).
+    Useful for 'Primary Source' searches where ISBNs don't exist.
     """
     params = {
         "q": query,
         "fo": "json",
-        "c": limit,
-        "at": "results"
+        "c": limit, # Count limit
+        "at": "results" # Minimal response
     }
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(LOC_SEARCH_API_BASE, params=params, timeout=10.0)
+            # We use the General Search endpoint here, not just /books
+            resp = await client.get(LOC_SEARCH_API_BASE, params=params, headers=HEADERS, timeout=10.0)
             if resp.status_code != 200:
                 return []
             
@@ -101,10 +109,12 @@ async def search_loc(query: str, limit: int = 10) -> List[Dict[str, Any]]:
             
             normalized_results = []
             for item in results:
+                # We skip items that are just web pages about the library
                 if "web page" in item.get("original_format", []):
                     continue
                     
                 normalized = _normalize_loc_item(item)
+                # Mark as a "Primary Source" so the frontend can show a special badge
                 normalized["is_primary_source"] = True 
                 normalized_results.append(normalized)
                 
@@ -158,13 +168,15 @@ def _normalize_loc_item(item: Dict[str, Any]) -> Dict[str, Any]:
                 name = c.get("name") or list(c.keys())[0] # Fallback for odd LOC structures
                 if name: authors.append({"name": name})
 
-    # 6. Extract Link
+    # 6. Extract Link (The "Read Online" link)
     loc_url = item.get("id") or item.get("url")
     if isinstance(loc_url, list): loc_url = loc_url[0] # Item endpoint might return list
 
     # 7. Extract LCCN (Critical for lookup)
     lccn = item.get("lccn") or item.get("library_of_congress_control_number")
-    if isinstance(lccn, list): lccn = lccn[0]
+    # Ensure LCCN is a list of strings
+    if isinstance(lccn, str): lccn = [lccn]
+    elif not lccn: lccn = []
 
     return {
         "title": item.get("title", "Untitled Document"),
@@ -174,10 +186,10 @@ def _normalize_loc_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "edition": edition,
         "subjects": subjects,
         "description": description,
-        "lccn": [lccn] if lccn else [], 
+        "lccn": lccn, 
         "call_number": item.get("call_number"),
-        "loc_url": loc_url,
-        "format": item.get("original_format", ["Unknown"])[0] 
+        "loc_url": loc_url, # Link to the item on loc.gov
+        "format": item.get("original_format", ["Unknown"])[0] # e.g. "Manuscript/Mixed Material"
     }
 
 def _clean_loc_date(date_str: str) -> Optional[str]:
@@ -186,6 +198,7 @@ def _clean_loc_date(date_str: str) -> Optional[str]:
     """
     if not date_str:
         return None
+    # Extract the first 4-digit year found
     match = re.search(r"(\d{4})", str(date_str))
     if match:
         return match.group(1)

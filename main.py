@@ -1,4 +1,4 @@
-# (v4.6.0) - Tri-Hybrid Architecture + Fixed ID Search Routing
+# (v4.8.0) - Tri-Hybrid + Title Boosting + Indie Rescue + Ghost Book Filter
 import os
 import httpx
 import asyncio
@@ -6,7 +6,7 @@ import json
 import hashlib
 import sys
 import re
-from datetime import datetime
+from datetime import datetime, timedelta # Added timedelta
 from pathlib import Path
 from fastapi import FastAPI, Query, HTTPException, Request, Depends, Path as FastAPIPath, Header, Response, status
 from pydantic import BaseModel, Field, ValidationError
@@ -44,7 +44,7 @@ limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL, default_li
 app = FastAPI(
     title="Bookfinder Intelligent API",
     description="A robust, heuristic-driven book API with automated tagging, series detection, and deep mining.",
-    version="4.6.0" 
+    version="4.8.0" 
 )
 
 app.state.limiter = limiter
@@ -187,6 +187,7 @@ class MergedBook(BaseModel):
     content_flag: Optional[str] = None
     data_source: str = "hybrid"
     data_sources: List[str] = Field(default_factory=list)
+    lccn: List[str] = Field(default_factory=list) 
 
 class SearchResultItem(BaseModel):
     title: str
@@ -206,7 +207,7 @@ class SearchResultItem(BaseModel):
     format_tag: Optional[str] = None
     description: Optional[str] = None
     data_sources: List[str] = Field(default_factory=list)
-    lccn: List[str] = Field(default_factory=list) # Added LCCN field to SearchResultItem
+    lccn: List[str] = Field(default_factory=list)
 
 class HybridSearchResponse(BaseModel):
     query: str
@@ -392,20 +393,10 @@ def _convert_isbn10_to_isbn13(isbn10: str) -> str:
     return f"{base}{check_digit}"
 
 def validate_and_clean_isbn(isbn: str = FastAPIPath(...)) -> str:
-    # 1. Clean input
     cleaned = re.sub(r"[\s-]+", "", isbn)
-    
-    # 2. ISBN 13 Check
     if len(cleaned) == 13 and _is_valid_isbn13_checksum(cleaned): return cleaned
-    
-    # 3. ISBN 10 Check -> Convert
     if len(cleaned) == 10 and _is_valid_isbn10_checksum(cleaned): return _convert_isbn10_to_isbn13(cleaned)
-    
-    # 4. LCCN Fallback (Must be numeric and 8+ digits)
-    if cleaned.isdigit() and len(cleaned) >= 8:
-        return cleaned 
-        
-    # 5. Fail
+    if cleaned.isdigit() and len(cleaned) >= 8: return cleaned 
     raise HTTPException(status_code=400, detail="Invalid ISBN or Identifier.")
 
 def _get_isbns_from_google_item(item: Dict[str, Any]) -> (Optional[str], Optional[str]):
@@ -428,13 +419,10 @@ def _get_isbns_from_ol_item(item: Dict[str, Any]) -> (Optional[str], Optional[st
 def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
     g_info = item.get("volumeInfo", {})
     isbn_13, isbn_10 = _get_isbns_from_google_item(item)
-    
     links = g_info.get("imageLinks", {})
     raw_thumbnail = ensure_https(links.get("thumbnail"))
-    
     extra_large = ensure_https(links.get("extraLarge"))
     if not extra_large and raw_thumbnail: extra_large = generate_high_res_url(raw_thumbnail)
-    
     large = ensure_https(links.get("large"))
     if not large and raw_thumbnail: large = generate_high_res_url(raw_thumbnail)
 
@@ -446,22 +434,17 @@ def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         large=large,
         extraLarge=extra_large
     )
-    
     cover_url = g_covers.thumbnail or g_covers.smallThumbnail or g_covers.small or g_covers.medium
-
     if not cover_url:
         cover_id = isbn_13 if isbn_13 else isbn_10
         if cover_id: cover_url = f"https://covers.openlibrary.org/b/isbn/{cover_id}-M.jpg"
 
     raw_authors = g_info.get("authors", [])
     author_objects = [AuthorItem(name=a, key=None) for a in raw_authors]
-
     smart_cats = _process_rich_categories(g_info.get("categories", []))
-    
     if len(smart_cats) < 2:
         desc_text = g_info.get("description", "") + " " + g_info.get("title", "")
         smart_cats = heuristic_tagging(desc_text, smart_cats)
-
     series = detect_series(g_info.get("title", ""), g_info.get("subtitle"))
     fmt = classify_format(g_info.get("pageCount"), item.get("saleInfo", {}).get("isEbook", False))
 
@@ -486,21 +469,17 @@ def _google_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
 
 def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
     isbn_13, isbn_10 = _get_isbns_from_ol_item(item)
-    
     raw_names = item.get("author_name", [])
     raw_keys = item.get("author_key", [])
     author_objects = []
     for i, name in enumerate(raw_names):
         key = raw_keys[i] if i < len(raw_keys) else None
         author_objects.append(AuthorItem(name=name, key=key))
-
     smart_cats = _process_rich_categories(item.get("subject", []))[:8]
     pub_date = str(item.get("first_publish_year")) if item.get("first_publish_year") else None
-    
     cover_url = None
     if "cover_i" in item:
          cover_url = f"https://covers.openlibrary.org/b/id/{item['cover_i']}-M.jpg"
-    
     return SearchResultItem(
         title=item.get("title", "No Title"),
         subtitle=item.get("subtitle"),
@@ -515,10 +494,8 @@ def _ol_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         data_sources=["Open Library"]
     )
 
-# NEW: LOC Mapper (Fixed)
 def _loc_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
     raw_authors = item.get("authors", [])
-    # Handle list of dicts or list of strings
     author_objects = []
     for a in raw_authors:
         if isinstance(a, dict):
@@ -537,13 +514,14 @@ def _loc_item_to_search_result(item: Dict[str, Any]) -> SearchResultItem:
         description=item.get("description"),
         format_tag="Primary Source",
         data_sources=["Library of Congress"],
-        lccn=item.get("lccn") # PASS LCCN
+        lccn=item.get("lccn")
     )
 
 def _merge_and_deduplicate_results(
     google_results: List[SearchResultItem],
     ol_results: List[SearchResultItem],
-    loc_results: List[Dict[str, Any]] = [] # Now accepts raw dicts
+    loc_results: List[Dict[str, Any]] = [],
+    query: str = "" 
 ) -> List[SearchResultItem]:
     merged_books: Dict[str, SearchResultItem] = {}
     
@@ -551,16 +529,13 @@ def _merge_and_deduplicate_results(
         if not item.authors: return f"noauth-{item.title.lower().strip()}"
         return f"{item.title.lower().strip()}|{item.authors[0].name.lower().strip()}"
 
-    # 1. Process Google
     for item in google_results:
         key = item.isbn_13 or get_fallback_key(item)
         if key: merged_books[key] = item
 
-    # 2. Process Open Library
     for item in ol_results:
         key = item.isbn_13 or get_fallback_key(item)
         if not key: continue
-
         if key in merged_books:
             existing = merged_books[key]
             if not existing.open_library_work_id: existing.open_library_work_id = item.open_library_work_id
@@ -570,9 +545,7 @@ def _merge_and_deduplicate_results(
         else:
             merged_books[key] = item
 
-    # 3. Process LOC
     clean_loc_results = [_loc_item_to_search_result(item) for item in loc_results]
-
     for item in clean_loc_results:
         key = get_fallback_key(item) 
         if key in merged_books:
@@ -580,7 +553,6 @@ def _merge_and_deduplicate_results(
              if "Library of Congress" not in existing.data_sources:
                  existing.data_sources.append("Library of Congress")
              existing.format_tag = "Primary Source"
-             # Update LCCN if missing
              if item.lccn and not existing.lccn:
                  existing.lccn = item.lccn
         else:
@@ -592,6 +564,34 @@ def _merge_and_deduplicate_results(
         if book.isbn_13: score += 5
         if "Library of Congress" in book.data_sources: score += 3 
         if book.published_date: score += 1
+        
+        # --- PHASE 2 & 3: RELEVANCE BOOSTING ---
+        if query:
+            def norm(s): return re.sub(r'[^a-z0-9]', '', str(s).lower())
+            q_clean = norm(query)
+
+            # TITLE MATCH BOOST
+            if book.title:
+                t_clean = norm(book.title)
+                if q_clean == t_clean:
+                    score += 500 
+                elif q_clean in t_clean and len(q_clean) > 5:
+                    score += 20  
+
+            # AUTHOR AUTHORITY BOOST
+            if book.authors:
+                for author in book.authors:
+                    a_clean = norm(author.name)
+                    if q_clean == a_clean:
+                        score += 600 
+                    elif q_clean in a_clean and len(q_clean) > 4:
+                        score += 100 
+
+            # INDIE RESCUE
+            if book.title and not book.cover_url:
+                if norm(query) == norm(book.title):
+                    score += 200
+
         return score
 
     final_list = list(merged_books.values())
@@ -766,7 +766,7 @@ async def get_cache_stats(request: Request, admin: bool = Depends(get_admin_key)
         return CacheStats(status="error", key_count=0, used_memory="0B", redis_url=f"Error: {str(e)}")
 
 @app.get("/")
-async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v4.6.0 is running!"}
+async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v4.8.0 is running!"}
 
 @app.get("/genres/fiction", response_model=List[fiction.Genre])
 @limiter.limit("20/minute")
@@ -779,6 +779,14 @@ async def get_non_fiction_genres(request: Request): return non_fiction.NON_FICTI
 def _merge_loc_data(book: MergedBook, loc_data: dict) -> MergedBook:
     if not loc_data:
         return book
+    
+    # FIX: Overwrite default title/description if LOC provides better ones
+    if book.title == "Title Not Found" and loc_data.get("title"):
+        book.title = loc_data["title"]
+    
+    if not book.description and loc_data.get("description"):
+        book.description = loc_data["description"]
+        
     if loc_data.get("published_date"):
         book.published_date = loc_data["published_date"]
     if loc_data.get("subjects"):
@@ -786,6 +794,10 @@ def _merge_loc_data(book: MergedBook, loc_data: dict) -> MergedBook:
         book.subjects = sorted(list(combined))
     if not book.publisher and loc_data.get("publisher"):
         book.publisher = loc_data["publisher"]
+    
+    # FIX: Map LCCN if available
+    if loc_data.get("lccn"):
+        book.lccn = loc_data["lccn"]
     
     # Attribution
     if book.data_sources is not None and "Library of Congress" not in book.data_sources:
@@ -889,6 +901,11 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
             
     if not final_authors:
         final_authors = [AuthorItem(name=a, key=None) for a in g_info.get("authors", [])]
+    
+    # If authors still empty, try LOC
+    if not final_authors and loc_data.get("authors"):
+        for a in loc_data.get("authors", []):
+             final_authors.append(AuthorItem(name=a.get("name", "Unknown")))
 
     # Initialize variables to avoid scope errors
     isbn_10 = None
@@ -961,7 +978,8 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         related_isbns=related_isbns,
         content_flag=content_flag,
         data_source="hybrid",
-        data_sources=sources
+        data_sources=sources,
+        lccn=[] # Default empty list for MergedBook
     )
     
     return _merge_loc_data(merged_book, loc_data)
@@ -994,20 +1012,49 @@ async def search_hybrid(request: Request, q: str, subject: Optional[str] = None,
             return [res] if res else []
             
         loc_task = loc_id_wrapper(q)
+        
+        # Parallel Execution (Simulated for single task, but consistent structure)
+        google_results, ol_results, loc_results = await asyncio.gather(
+            google_task, ol_task, loc_task
+        )
+        
     else:
-        google_task = search_google(q, limit, start_index, subject)
-        ol_task = search_open_library(q, limit, start_index, subject)
-        loc_task = loc.search_loc(q, limit)
+        # Phase 1: Literalist Query Injection (The Fix for 'Girl, Incorrupted')
+        # If the query is multi-word, launch a parallel "Exact Phrase" search
+        if " " in q and len(q) > 5:
+            # We fire 4 tasks: Google Fuzzy, Google Exact, OL Fuzzy, OL Exact
+            google_task = search_google(q, limit, start_index, subject)
+            google_exact = search_google(f'"{q}"', limit, start_index, subject)
+            
+            ol_task = search_open_library(q, limit, start_index, subject)
+            ol_exact = search_open_library(f'"{q}"', limit, start_index, subject)
+            
+            loc_task = loc.search_loc(q, limit)
 
-    # 2. Execute Parallel Search
-    google_results, ol_results, loc_results = await asyncio.gather(
-        google_task, 
-        ol_task, 
-        loc_task
-    )
+            # Gather all 5 tasks
+            results_tuple = await asyncio.gather(
+                google_task, google_exact, ol_task, ol_exact, loc_task
+            )
+            
+            # Combine Exact + Fuzzy results (Exact first)
+            google_results = results_tuple[1] + results_tuple[0] 
+            ol_results = results_tuple[3] + results_tuple[2]
+            loc_results = results_tuple[4]
+            
+        else:
+            # Standard Path
+            google_task = search_google(q, limit, start_index, subject)
+            ol_task = search_open_library(q, limit, start_index, subject)
+            loc_task = loc.search_loc(q, limit)
+
+            google_results, ol_results, loc_results = await asyncio.gather(
+                google_task, 
+                ol_task, 
+                loc_task
+            )
     
-    # 3. Merge
-    final_results = _merge_and_deduplicate_results(google_results, ol_results, loc_results)
+    # 3. Merge (Pass query for Title Boosting)
+    final_results = _merge_and_deduplicate_results(google_results, ol_results, loc_results, query=q)
     return HybridSearchResponse(query=q, subject=subject, num_found=len(final_results), results=final_results)
 
 # --- QUALITY GATE HELPER ---
@@ -1021,14 +1068,38 @@ def _is_valid_release(book: SearchResultItem) -> bool:
     reprint_triggers = ["anniversary edition", "classic", "reissue", "reprint"]
     if any(trigger in lower_title for trigger in reprint_triggers): return False
     if not book.published_date: return False
+    
+    # --- DATE VALIDATION LOGIC (Ghost Book Fix) ---
     try:
+        now = datetime.now()
+        # Define the window: 1 Year Ago <-> 90 Days Future
+        cutoff_past = now - timedelta(days=365)
+        cutoff_future = now + timedelta(days=90)
+
+        # 1. Parse Year first (fast fail)
         match = re.search(r"(\d{4})", book.published_date)
         if not match: return False
         year = int(match.group(1))
-        current_year = datetime.now().year
-        if year < (current_year - 1): return False
-    except:
+
+        # Basic Year Checks
+        if year < (now.year - 1): return False # Too Old
+        if year > (now.year + 1): return False # Too Far Future (2027+)
+
+        # 2. Strict Date Parsing (if possible)
+        # Try YYYY-MM-DD
+        try:
+            pub_dt = datetime.strptime(book.published_date[:10], "%Y-%m-%d")
+            if pub_dt < cutoff_past or pub_dt > cutoff_future:
+                return False
+        except ValueError:
+            # Fallback: If it's just a year (2025), and we are in 2025, it passes.
+            # If it is 2026, and we are in Dec 2025, it might be valid.
+            # We let the basic year check handle the rough edges.
+            pass
+
+    except Exception:
         return False
+
     return True
 
 # --- THE DEEP DREDGE ENDPOINT ---
@@ -1060,6 +1131,7 @@ async def get_new_releases(request: Request, subject: Optional[str] = None, limi
                     except Exception as e:
                         pass
             
+            # Apply the new Date Validator here
             if _is_valid_release(book):
                 valid_books.append(book)
                 
@@ -1217,3 +1289,4 @@ async def get_work_editions(request: Request, work_key: str):
             entry["isbn_13"] = entry.get("identifiers", {}).get("isbn_13", [])
             entry["isbn_10"] = entry.get("identifiers", {}).get("isbn_10", [])
     return WorkEditionsResponse(**editions_data)
+#test 1.0
