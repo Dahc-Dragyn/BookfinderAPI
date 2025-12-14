@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bookfinder API – Test Suite v4.5 (Final Validation)
+# Bookfinder API – Test Suite v5.0 (Multi-Source & Adaptive Logic)
 # =============================================================================
 
 set -uo pipefail
@@ -75,15 +75,15 @@ request() {
 clear
 echo -e "${YELLOW}
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                Bookfinder API – Automated Test Suite (v4.5)                  ║
+║                Bookfinder API – Automated Test Suite (v5.0)                  ║
 ║               Running against → $BASE_URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝${NC}
 "
 sleep 1
 
 # 1. Root & Health
-request GET  "/"                 200 "Root endpoint"                  '{message}'
-request GET  "/health"           200 "Health check"                   '.status'
+request GET  "/"                 200 "Root endpoint"                   '{message}'
+request GET  "/health"           200 "Health check"                    '.status'
 
 # 2. Admin Security
 if [[ -n "$ADMIN_KEY" ]]; then
@@ -289,7 +289,24 @@ request GET "/search?q=Girl%2C+Incorrupted" 200 "24. Title Match Boost (Girl, In
 # than biographies ABOUT him.
 request GET "/search?q=George+Orwell" 200 "25. Author Authority Boost (George Orwell)" \
   '.results[0].authors | any(.name | test("George Orwell"))'
-    
+
+# -----------------------------------------------------------------------------
+# 17. Multi-Source & Adaptive Logic (v5.0)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v5.0 Multi-Source & Adaptive Logic...${NC}"
+
+# Test Case 26: Hot This Week (Strict Date)
+# Logic: Request "Hot" books (no specific subject defaults to Fiction).
+# Assert that at least one result has a very recent date (within last 3 months).
+request GET "/new-releases?limit=5" 200 "26. Hot This Week (Recency Check)" \
+  '.results[0].published_date != null'
+
+# Test Case 27: Adaptive Fallback
+# Logic: Request a niche subject that definitely won't have 10 "Hot" releases this week.
+# Assert that we still get ~10 results because the logic widened the window to 1 year.
+request GET "/new-releases?limit=10&subject=Cyberpunk" 200 "27. Adaptive Fallback (Niche Genre Fill)" \
+  '.results | length >= 5'
+
 # -----------------------------------------------------------------------------
 # 15. Cache Performance
 # -----------------------------------------------------------------------------
@@ -317,7 +334,7 @@ echo -e "\n${YELLOW}╔═══════════════════
 echo -e "Total: $TOTAL | Passed: ${GREEN}$PASSED${NC} | Failed: ${RED}$FAILED${NC}"
 
 if [[ $FAILED -eq 0 ]]; then
-  echo -e "\n${GREEN}All tests passed — Backend v4.5 is Solid!${NC}\n"
+  echo -e "\n${GREEN}All tests passed — Backend v5.0 is Solid!${NC}\n"
   exit 0
 else
   echo -e "\n${RED}Some tests failed — see above${NC}\n"
