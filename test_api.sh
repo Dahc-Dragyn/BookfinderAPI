@@ -307,6 +307,41 @@ request GET "/new-releases?limit=5" 200 "26. Hot This Week (Recency Check)" \
 request GET "/new-releases?limit=10&subject=Cyberpunk" 200 "27. Adaptive Fallback (Niche Genre Fill)" \
   '.results | length >= 5'
 
+# Test Case 28: Future Date Spam Block (No 2026/2027)
+request GET "/new-releases?limit=20" 200 "28. Future Date Spam Block (No 2026/2027)" \
+  '.results | all(.published_date | .[0:4] | tonumber | . != 2026 and . != 2027)'
+# ------------------
+
+# Test Case 29: The Void (Zero Results)
+# Logic: Search for a random nonsense string. 
+# Assert we get a 200 OK and an empty list, not a crash or 404.
+request GET "/search?q=x8z9q2w3e4r5t6y7u8i9o0p" 200 "29. The Void (Zero Results Handling)" \
+  '.num_found == 0 and .results == []'
+
+# Test Case 30: URL Encoding (Special Chars)
+# Logic: Search for a title with an ampersand (&). 
+# Assert the API handles the encoding correctly and finds the book.
+request GET "/search?q=Dungeons+%26+Dragons" 200 "30. URL Encoding (Ampersand Handling)" \
+  '.results | length > 0'
+
+# Test Case 31: Advanced Operator Pass-through
+# Logic: Use a Google-specific operator (intitle:). 
+# Assert the backend passes this through and returns relevant results.
+request GET "/search?q=intitle:Dune" 200 "31. Advanced Operator (intitle:)" \
+  '.results[0].title | contains("Dune")'
+
+# Test Case 32: Pagination Deep Dive
+# Logic: Ask for the 2nd page of results (startIndex=10).
+# Assert we get results, but they are likely different from the top result of page 1.
+# (We just check we got results here to be safe).
+request GET "/search?q=History&startIndex=10&limit=5" 200 "32. Pagination Deep Dive (Page 2)" \
+  '.results | length > 0'
+
+# Test Case 33: Author 404 Handling
+# Logic: Try to fetch a profile for a non-existent author ID.
+# Assert we get a 404 (or a handled empty state), ensuring the app doesn't spin forever.
+request GET "/author/The_Man_Who_Does_Not_Exist_12345" 404 "33. Author 404 Handling" \
+  '.detail | contains("not found")'
 # -----------------------------------------------------------------------------
 # 15. Cache Performance
 # -----------------------------------------------------------------------------

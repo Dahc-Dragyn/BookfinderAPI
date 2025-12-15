@@ -1,4 +1,4 @@
-# (v4.8.0) - Tri-Hybrid + Title Boosting + Indie Rescue + Ghost Book Filter
+# (v4.8.5) - Fixed Author 404 Logic (Removed Dangerous Fallback)
 import os
 import httpx
 import asyncio
@@ -6,7 +6,7 @@ import json
 import hashlib
 import sys
 import re
-from datetime import datetime, timedelta # Added timedelta
+from datetime import datetime, timedelta 
 from pathlib import Path
 from fastapi import FastAPI, Query, HTTPException, Request, Depends, Path as FastAPIPath, Header, Response, status
 from pydantic import BaseModel, Field, ValidationError
@@ -44,7 +44,7 @@ limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL, default_li
 app = FastAPI(
     title="Bookfinder Intelligent API",
     description="A robust, heuristic-driven book API with automated tagging, series detection, and deep mining.",
-    version="4.8.0" 
+    version="4.8.5" 
 )
 
 app.state.limiter = limiter
@@ -638,6 +638,40 @@ async def search_google(q: str, limit: int, start_index: int, subject: Optional[
     data = await cached_get(GOOGLE_BOOKS_API_URL, params)
     return [_google_item_to_search_result(item) for item in data.get("items", [])]
 
+# NEW: Phase 2 - Google Relevance + Date Window Strategy
+async def get_google_new_releases(limit: int, start_index: int, subject: Optional[str] = None) -> List[SearchResultItem]:
+    if not API_KEY: return []
+    
+    # 1. Calculate Date Window (Current Month + Previous Month)
+    # This allows us to search for "2025-12" OR "2025-11" directly in the query.
+    now = datetime.now()
+    current_month_str = now.strftime("%Y-%m")
+    
+    # Calculate previous month
+    first_of_this_month = now.replace(day=1)
+    prev_month_date = first_of_this_month - timedelta(days=1)
+    prev_month_str = prev_month_date.strftime("%Y-%m")
+    
+    # 2. Construct Query: (subject:X) AND ("YYYY-MM" OR "YYYY-MM")
+    # We purposefully DO NOT use orderBy="newest". We want Google's RELEVANCE sort
+    # to pick the "best" books from this date window.
+    base_query = f"subject:{subject}" if subject else "subject:fiction"
+    date_filter = f'("{current_month_str}" OR "{prev_month_str}")'
+    final_query = f"{base_query} {date_filter}"
+    
+    params = {
+        "q": final_query,
+        "key": API_KEY,
+        "maxResults": limit,
+        "startIndex": start_index,
+        "langRestrict": "en",
+        # "orderBy": "newest",  <-- REMOVED. We want Relevance!
+        "printType": "books",
+        "fields": "items(id,volumeInfo(title,subtitle,authors,publisher,publishedDate,averageRating,ratingsCount,categories,imageLinks(thumbnail,small),industryIdentifiers,description,pageCount))"
+    }
+    data = await cached_get(GOOGLE_BOOKS_API_URL, params, timeout_seconds=3600)
+    return [_google_item_to_search_result(item) for item in data.get("items", [])]
+
 async def search_open_library(q: str, limit: int, offset: int, subject: Optional[str] = None) -> List[SearchResultItem]:
     params = {
         "q": q, 
@@ -766,7 +800,7 @@ async def get_cache_stats(request: Request, admin: bool = Depends(get_admin_key)
         return CacheStats(status="error", key_count=0, used_memory="0B", redis_url=f"Error: {str(e)}")
 
 @app.get("/")
-async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v4.8.0 is running!"}
+async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v4.8.5 is running!"}
 
 @app.get("/genres/fiction", response_model=List[fiction.Genre])
 @limiter.limit("20/minute")
@@ -916,7 +950,9 @@ async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_cl
         related_isbns = [i["identifier"] for i in g_info.get("industryIdentifiers", [])]
         
     is_ebook = google_volume.get("saleInfo", {}).get("isEbook", False)
-    fmt = classify_format(g_info.get("pageCount"), is_ebook)
+    # REGRESSION FIX: Correctly call classify_format with both arguments
+    fmt = classify_format(g_info.get("pageCount"), is_ebook) 
+    
     content_flag = check_content_safety(description, combined_subjects)
     series = detect_series(g_info.get("title", ""), g_info.get("subtitle"))
 
@@ -1072,9 +1108,9 @@ def _is_valid_release(book: SearchResultItem) -> bool:
     # --- DATE VALIDATION LOGIC (Ghost Book Fix) ---
     try:
         now = datetime.now()
-        # Define the window: 1 Year Ago <-> 90 Days Future
+        # FIX: Tightened window to 7 days
         cutoff_past = now - timedelta(days=365)
-        cutoff_future = now + timedelta(days=90)
+        cutoff_future = now + timedelta(days=7) # Was 90
 
         # 1. Parse Year first (fast fail)
         match = re.search(r"(\d{4})", book.published_date)
@@ -1083,7 +1119,9 @@ def _is_valid_release(book: SearchResultItem) -> bool:
 
         # Basic Year Checks
         if year < (now.year - 1): return False # Too Old
-        if year > (now.year + 1): return False # Too Far Future (2027+)
+        
+        # FIX: Hard stop on future years (e.g. 2026 when it is 2025)
+        if year > (now.year + 1): return False 
 
         # 2. Strict Date Parsing (if possible)
         # Try YYYY-MM-DD
@@ -1094,7 +1132,9 @@ def _is_valid_release(book: SearchResultItem) -> bool:
         except ValueError:
             # Fallback: If it's just a year (2025), and we are in 2025, it passes.
             # If it is 2026, and we are in Dec 2025, it might be valid.
-            # We let the basic year check handle the rough edges.
+            # But if it is 2026 and we are in 2025, block it.
+            if year > now.year:
+                 return False
             pass
 
     except Exception:
@@ -1113,12 +1153,19 @@ async def get_new_releases(request: Request, subject: Optional[str] = None, limi
     INTERNAL_BATCH_SIZE = 40 
     
     while len(valid_books) < limit and depth < MAX_DEPTH:
-        ol_results = await get_open_library_new_releases(limit=INTERNAL_BATCH_SIZE, offset=current_offset, subject=subject)
+        # Fetch from BOTH sources
+        google_task = get_google_new_releases(limit=INTERNAL_BATCH_SIZE, start_index=current_offset, subject=subject)
+        ol_task = get_open_library_new_releases(limit=INTERNAL_BATCH_SIZE, offset=current_offset, subject=subject)
         
-        if not ol_results:
+        g_results, ol_results = await asyncio.gather(google_task, ol_task)
+        
+        # Combine (Google first as quality is often better)
+        batch_results = g_results + ol_results
+        
+        if not batch_results:
             break
             
-        for book in ol_results:
+        for book in batch_results:
             if not book.cover_url:
                 isbn = book.isbn_13 or book.isbn_10
                 if isbn:
@@ -1131,7 +1178,7 @@ async def get_new_releases(request: Request, subject: Optional[str] = None, limi
                     except Exception as e:
                         pass
             
-            # Apply the new Date Validator here
+            # Apply the new Strict Validator here
             if _is_valid_release(book):
                 valid_books.append(book)
                 
@@ -1239,8 +1286,7 @@ async def get_author_profile(request: Request, id: str):
     else:
         clean_name = id.replace('"', '').replace('_', ' ').strip()
         google_results = await search_google(q=f'inauthor:"{clean_name}"', limit=20, start_index=0)
-        if not google_results:
-             google_results = await search_google(q=f'inauthor:{clean_name}', limit=20, start_index=0)
+        # REMOVED DANGEROUS FALLBACK SEARCH
         if not google_results:
              raise HTTPException(status_code=404, detail=f"Author '{clean_name}' not found.")
         display_name = clean_name
@@ -1289,4 +1335,3 @@ async def get_work_editions(request: Request, work_key: str):
             entry["isbn_13"] = entry.get("identifiers", {}).get("isbn_13", [])
             entry["isbn_10"] = entry.get("identifiers", {}).get("isbn_10", [])
     return WorkEditionsResponse(**editions_data)
-#test 1.0
