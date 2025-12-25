@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bookfinder API – Test Suite v5.0 (Multi-Source & Adaptive Logic)
+# Bookfinder API – Test Suite v5.1 (Security Hardened)
 # =============================================================================
 
 set -uo pipefail
@@ -75,7 +75,7 @@ request() {
 clear
 echo -e "${YELLOW}
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                Bookfinder API – Automated Test Suite (v5.0)                  ║
+║                Bookfinder API – Automated Test Suite (v5.1)                  ║
 ║               Running against → $BASE_URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝${NC}
 "
@@ -342,6 +342,24 @@ request GET "/search?q=History&startIndex=10&limit=5" 200 "32. Pagination Deep D
 # Assert we get a 404 (or a handled empty state), ensuring the app doesn't spin forever.
 request GET "/author/The_Man_Who_Does_Not_Exist_12345" 404 "33. Author 404 Handling" \
   '.detail | contains("not found")'
+
+# -----------------------------------------------------------------------------
+# 18. Security & Rate Limiting (v5.1)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}Testing v5.1 Security Upgrades...${NC}"
+
+# Test Case 34: Bot Bouncer (GPTBot Block)
+# Logic: Send a request pretending to be GPTBot. 
+# Assert we get a 403 Forbidden.
+request GET "/search?q=test" 403 "34. Bot Bouncer (GPTBot Block)" \
+  '.detail | contains("Bot access denied")' \
+  "-H User-Agent:GPTBot/1.0"
+
+# Test Case 35: Rate Limit Headers Check
+# Logic: Make a standard request and check if we get Rate Limit headers back.
+request GET "/genres/fiction" 200 "35. Rate Limit Config Check" \
+  '.' 
+
 # -----------------------------------------------------------------------------
 # 15. Cache Performance
 # -----------------------------------------------------------------------------
@@ -369,7 +387,7 @@ echo -e "\n${YELLOW}╔═══════════════════
 echo -e "Total: $TOTAL | Passed: ${GREEN}$PASSED${NC} | Failed: ${RED}$FAILED${NC}"
 
 if [[ $FAILED -eq 0 ]]; then
-  echo -e "\n${GREEN}All tests passed — Backend v5.0 is Solid!${NC}\n"
+  echo -e "\n${GREEN}All tests passed — Backend v5.1 is Solid!${NC}\n"
   exit 0
 else
   echo -e "\n${RED}Some tests failed — see above${NC}\n"

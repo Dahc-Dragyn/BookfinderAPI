@@ -1,4 +1,4 @@
-# (v4.8.5) - Fixed Author 404 Logic (Removed Dangerous Fallback)
+# (v5.1) - Added Bot Bouncer, Proxy-Aware IP Detection, and Tiered Rate Limiting
 import os
 import httpx
 import asyncio
@@ -39,16 +39,57 @@ load_dotenv(dotenv_path=env_path)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL, default_limits=["100/minute"])
+# --- SECURITY UPGRADE: Proxy-Aware IP Detection ---
+# This ensures we rate limit the ACTUAL user IP, not the Caddy/Ngrok IP
+def get_real_ip(request: Request):
+    # Check X-Forwarded-For (Standard for Proxies)
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        # The first IP in the list is the original client
+        return forwarded.split(",")[0].strip()
+    # Fallback to direct connection IP (for local testing)
+    return request.client.host or "127.0.0.1"
+
+# Initialize Limiter with the new Smart IP detector
+limiter = Limiter(key_func=get_real_ip, storage_uri=REDIS_URL, default_limits=["100/minute"])
 
 app = FastAPI(
     title="Bookfinder Intelligent API",
     description="A robust, heuristic-driven book API with automated tagging, series detection, and deep mining.",
-    version="4.8.5" 
+    version="5.1.0" 
 )
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# --- SECURITY UPGRADE: The "Bouncer" Middleware ---
+# Blocks bad bots BEFORE they touch any logic or database
+@app.middleware("http")
+async def block_bad_bots(request: Request, call_next):
+    user_agent = request.headers.get("user-agent", "").lower()
+    
+    # The Blacklist: Add any bot here that causes trouble
+    bad_bots = [
+        "gptbot",        # OpenAI
+        "bytespider",    # ByteDance (TikTok)
+        "claudebot",     # Anthropic
+        "ccbot",         # Common Crawl
+        "anthropic-ai",
+        "omgilibot",
+        "facebookexternalhit"
+    ]
+    
+    # Bypass logic: Allow internal health checks or known good agents if needed
+    if any(bot in user_agent for bot in bad_bots):
+        logger.warning(f"BLOCKED BOT: {user_agent} from {get_real_ip(request)}")
+        return Response(
+            content=json.dumps({"detail": "Bot access denied. Please respect robots.txt."}), 
+            status_code=status.HTTP_403_FORBIDDEN,
+            media_type="application/json"
+        )
+    
+    response = await call_next(request)
+    return response
 
 API_KEY = os.getenv("GOOGLE_API_KEY")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
@@ -96,6 +137,10 @@ async def cached_get(
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, params=filtered_params, timeout=20.0)
             if resp.status_code == 404: return {} 
+            # Gracefully handle 429 from Upstream (Google/LOC) to prevent crashes
+            if resp.status_code == 429:
+                logger.error(f"UPSTREAM RATE LIMIT: {url}")
+                raise HTTPException(status_code=429, detail="Upstream provider is rate limiting us.")
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPError as e:
@@ -383,7 +428,7 @@ def _is_valid_isbn13_checksum(isbn: str) -> bool:
     for i in range(12):
         digit = int(isbn[i])
         total += digit * (1 if i % 2 == 0 else 3)
-    check_digit = (10 - (total % 10)) % 10
+        check_digit = (10 - (total % 10)) % 10
     return check_digit == int(isbn[12])
 
 def _convert_isbn10_to_isbn13(isbn10: str) -> str:
@@ -800,14 +845,15 @@ async def get_cache_stats(request: Request, admin: bool = Depends(get_admin_key)
         return CacheStats(status="error", key_count=0, used_memory="0B", redis_url=f"Error: {str(e)}")
 
 @app.get("/")
-async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v4.8.5 is running!"}
+async def read_root(request: Request): return {"message": "Bookfinder Intelligent API v5.1.0 is running!"}
 
 @app.get("/genres/fiction", response_model=List[fiction.Genre])
-@limiter.limit("20/minute")
+# --- SECURITY UPGRADE: Tiered Rate Limits (Light) ---
+@limiter.limit("60/minute")
 async def get_fiction_genres(request: Request): return fiction.FICTION_GENRES
 
 @app.get("/genres/non-fiction", response_model=List[non_fiction.Genre])
-@limiter.limit("20/minute")
+@limiter.limit("60/minute")
 async def get_non_fiction_genres(request: Request): return non_fiction.NON_FICTION_GENRES
 
 def _merge_loc_data(book: MergedBook, loc_data: dict) -> MergedBook:
@@ -841,7 +887,8 @@ def _merge_loc_data(book: MergedBook, loc_data: dict) -> MergedBook:
 
 # NEW: Unified Book/ID Handler (Fixed Variable Scope)
 @app.get("/book/isbn/{isbn}", response_model=MergedBook, tags=["Books"])
-@limiter.limit("100/minute")
+# --- SECURITY UPGRADE: Tiered Rate Limits (Heavy) ---
+@limiter.limit("20/minute") 
 async def get_book_by_isbn(request: Request, isbn: str = Depends(validate_and_clean_isbn)):
     # 1. Determine ID Type
     is_lccn = len(isbn) < 13 and isbn.isdigit()
@@ -1026,7 +1073,8 @@ def _is_lccn(q: str) -> bool:
     return clean.isdigit() and 8 <= len(clean) <= 12
 
 @app.get("/search", response_model=HybridSearchResponse, tags=["Books"])
-@limiter.limit("60/minute")
+# --- SECURITY UPGRADE: Tiered Rate Limits (Heavy) ---
+@limiter.limit("20/minute")
 async def search_hybrid(request: Request, q: str, subject: Optional[str] = None, limit: int = 10, start_index: int = 0):
     
     # 1. Determine Search Mode based on Input Type
@@ -1144,7 +1192,8 @@ def _is_valid_release(book: SearchResultItem) -> bool:
 
 # --- THE DEEP DREDGE ENDPOINT ---
 @app.get("/new-releases", response_model=NewReleasesResponse, tags=["Books"])
-@limiter.limit("30/minute")
+# --- SECURITY UPGRADE: Tiered Rate Limits (Heavy) ---
+@limiter.limit("15/minute")
 async def get_new_releases(request: Request, subject: Optional[str] = None, limit: int = 10, start_index: int = 0):
     valid_books = []
     current_offset = start_index
@@ -1251,7 +1300,8 @@ def _generate_dynamic_bio(name: str, books: List[SearchResultItem]) -> str:
     return f"{name} is a writer known for {top_genre}. Notable works include {works_str}."
 
 @app.get("/author/{id}", response_model=AuthorPageData, tags=["Discovery"])
-@limiter.limit("100/minute")
+# --- SECURITY UPGRADE: Tiered Rate Limits (Medium) ---
+@limiter.limit("20/minute")
 async def get_author_profile(request: Request, id: str):
     if id.startswith("OL") and id.endswith("A"):
         try:
@@ -1323,7 +1373,8 @@ async def get_author_profile(request: Request, id: str):
         )
 
 @app.get("/work/{work_key}", response_model=WorkEditionsResponse, tags=["Discovery"])
-@limiter.limit("100/minute")
+# --- SECURITY UPGRADE: Tiered Rate Limits (Medium) ---
+@limiter.limit("40/minute")
 async def get_work_editions(request: Request, work_key: str):
     if not (work_key.startswith("OL") and work_key.endswith("W")): raise HTTPException(status_code=400, detail="Invalid work key.")
     editions_data = await get_open_library_work_editions(work_key)

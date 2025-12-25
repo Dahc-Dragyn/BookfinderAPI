@@ -1,0 +1,8 @@
+Project,ML Model Type,Usefulness & Fun,Frontend Interaction
+"""Your Next Read"" Predictor",Natural Language Processing (NLP): Text Classification or Collaborative Filtering
+ (using techniques like embedding and simple matrix factorization).,"Fun: Directly taps into your passion for Epic Fantasy
+  and Urban Fantasy. Usefulness: Solves the common problem of ""what should I read next?"" in a personalized way.","User inputs
+   the title of a book they loved, and the system recommends 5 new books/genres based on similar attributes or themes."
+
+   https://sites.google.com/eng.ucsd.edu/ucsdbookgraph/
+   
